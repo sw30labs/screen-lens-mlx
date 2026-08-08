@@ -12,7 +12,6 @@ Usage:
 """
 import json
 import time
-from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -33,6 +32,7 @@ from .config import (
 )
 from .omlx_client import resolve_inference_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
+from .session import apply_video_slug, load_config
 
 app = typer.Typer(
     name="screenlens",
@@ -49,27 +49,10 @@ DEFAULT_DEVICE = default_embedding_device()
 DEFAULT_BATCH_SIZE = default_inference_concurrency()
 
 
-def _load_config(config_path: Optional[str] = None) -> ScreenLensConfig:
-    """Load config from file or use defaults."""
-    if config_path and Path(config_path).exists():
-        with open(config_path) as f:
-            return ScreenLensConfig(**json.load(f))
-    return ScreenLensConfig()
-
-
-def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
-    """Point config at a per-video slugged subfolder under ./data/.
-
-    Uses ``<video_stem>_<YYYYMMDD_HHMMSS>`` so repeated ingests of the same
-    video do not clobber each other. Mutates ``config`` in place and returns
-    the slug.
-    """
-    base_slug = video.stem.replace(" ", "_")
-    slug = f"{base_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    config.data_dir = Path(f"./data/{slug}")
-    config.vector_db.persist_directory = str(config.data_dir / "chromadb")
-    config.vector_db.collection_name = f"screenlens_{base_slug}"
-    return slug
+# Config/slug plumbing is shared with the TUI and the web command deck so a run
+# started from any front end lands in the same ./data/<slug>/ layout.
+_load_config = load_config
+_apply_video_slug = apply_video_slug
 
 
 def _apply_captioning_options(

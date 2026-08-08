@@ -26,6 +26,7 @@ from .omlx_client import (
     resolve_inference_context,
     resolve_inference_model,
 )
+from .session import text_role_captioning_config
 from .vector_store import ScreenLensVectorStore
 
 
@@ -233,7 +234,7 @@ def summarize_node(state: ScreenLensState) -> dict:
         summary = llm.invoke([("system", system), ("human", user)]).content
     else:
         summary = _inference_text_generate(
-            InferenceClient(config.captioning),
+            InferenceClient(text_role_captioning_config(config)),
             system,
             user,
             max_tokens=2048,
@@ -417,9 +418,11 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Full-video summary from {len(captioned)} frames")
     print(f"{'='*60}")
 
-    # Full summarization uses the selected direct provider.
-    model = InferenceClient(config.captioning)
-    model_context = resolve_inference_context(config.captioning)
+    # Summarization is text-only reasoning over captions, so it runs on the
+    # TEXT role rather than the vision model that produced them.
+    text_config = text_role_captioning_config(config)
+    model = InferenceClient(text_config)
+    model_context = resolve_inference_context(text_config)
     print(f"Using {model.backend.value} model: {model.model} at {model.base_url}")
 
     # ── Compute chunking strategy ────────────────────────────────────────

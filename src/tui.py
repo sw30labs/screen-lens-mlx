@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import io
-import json
 import logging
 import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
 from .config import CaptionBackend, ScreenLensConfig
+from .session import apply_video_slug, load_config, point_config_at_data_dir
 from .omlx_client import (
     is_known_text_only_model,
     list_models,
@@ -29,28 +28,10 @@ def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
 
 
-def _load_config(config_path: Path | None) -> ScreenLensConfig:
-    """Load a JSON config if it exists, otherwise return defaults."""
-    if config_path and config_path.exists():
-        with open(config_path) as f:
-            return ScreenLensConfig(**json.load(f))
-    return ScreenLensConfig()
-
-
-def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
-    """Point config at a per-video timestamped folder under config.data_dir."""
-    base_slug = video.stem.replace(" ", "_")
-    slug = f"{base_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    config.data_dir = config.data_dir / slug
-    config.vector_db.persist_directory = str(config.data_dir / "chromadb")
-    config.vector_db.collection_name = f"screenlens_{base_slug}"
-    return slug
-
-
-def _point_config_at_data_dir(config: ScreenLensConfig, data_dir: Path) -> None:
-    """Make data_dir and vector DB path agree for read-oriented commands."""
-    config.data_dir = data_dir
-    config.vector_db.persist_directory = str(data_dir / "chromadb")
+# Shared with the CLI and the web command deck — see src/session.py.
+_load_config = load_config
+_apply_video_slug = apply_video_slug
+_point_config_at_data_dir = point_config_at_data_dir
 
 
 def _model_label(config: ScreenLensConfig) -> str:

@@ -807,7 +807,7 @@ class TestPipeline:
 
     def test_search_summary_uses_selected_vllm_client(self, monkeypatch):
         import src.pipeline as pipeline
-        from src.config import CaptionBackend, ScreenLensConfig
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
         captured = {}
 
@@ -824,6 +824,9 @@ class TestPipeline:
         monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
         config = ScreenLensConfig()
         config.captioning.backend = CaptionBackend.vllm
+        # Summaries run on the TEXT role, so it is the reconstruction backend
+        # that decides the client (both are vLLM on Spark).
+        config.reconstruction.backend = InferenceBackend.vllm
 
         result = pipeline.summarize_node({
             "query": "What application is shown?",
@@ -1164,10 +1167,13 @@ class TestPipeline:
     @pytest.mark.parametrize("backend", ["vllm", "omlx"])
     def test_direct_caption_config_uses_reconstruction_timeout(self, backend):
         import src.reconstruct as reconstruct
-        from src.config import CaptionBackend, ScreenLensConfig
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
         config = ScreenLensConfig()
         config.captioning.backend = CaptionBackend(backend)
+        # Reconstruction runs on the text role, so its own backend selects the
+        # client; both roles point at one endpoint on a real deployment.
+        config.reconstruction.backend = InferenceBackend(backend)
         config.captioning.vllm_timeout_seconds = 120
         config.captioning.omlx_timeout_seconds = 120
         config.reconstruction.timeout_seconds = 2400

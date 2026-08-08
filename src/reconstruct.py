@@ -26,8 +26,9 @@ from typing import Annotated, Optional, TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from .config import CaptionBackend, ScreenLensConfig
+from .config import ScreenLensConfig
 from .omlx_client import InferenceClient, InferenceTruncatedError
+from .session import text_role_captioning_config
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
@@ -253,33 +254,16 @@ _MODEL_CACHE: dict = {}
 
 
 def _reconstruction_captioning_config(config: ScreenLensConfig):
-    """Return a direct-provider config with the reconstruction time budget."""
-    captioning = config.captioning
-    direct = captioning.model_copy(deep=True)
-    reconstruction = config.reconstruction
+    """Return the TEXT-role client config for reconstruction planning/QA.
 
-    if captioning.backend == CaptionBackend.ollama:
-        direct.backend = CaptionBackend(reconstruction.backend.value)
-        direct.max_tokens = reconstruction.max_tokens
-        if direct.backend == CaptionBackend.vllm:
-            direct.vllm_base_url = reconstruction.base_url
-            direct.vllm_model = reconstruction.model
-            direct.vllm_api_key = reconstruction.api_key
-            direct.vllm_model_context = reconstruction.model_context
-        else:
-            direct.omlx_base_url = reconstruction.base_url
-            direct.omlx_model = reconstruction.model
-            direct.omlx_api_key = reconstruction.api_key
-            direct.omlx_model_context = reconstruction.model_context
-
-    # Artifact synthesis is a substantially longer generation than a frame
-    # caption. Apply its independent timeout even when both stages use the same
-    # direct endpoint and model.
-    if direct.backend == CaptionBackend.vllm:
-        direct.vllm_timeout_seconds = reconstruction.timeout_seconds
-    else:
-        direct.omlx_timeout_seconds = reconstruction.timeout_seconds
-    return direct
+    Reconstruction never looks at frames — it reasons over captions — so it runs
+    on ``config.reconstruction`` (the text model), not the vision model that
+    produced those captions. That also applies the reconstruction timeout, which
+    artifact synthesis needs: it is a far longer generation than one caption.
+    On DGX Spark both roles resolve to the same served vLLM checkpoint, so the
+    model choice is a no-op there.
+    """
+    return text_role_captioning_config(config)
 
 
 def get_inference_client(config: ScreenLensConfig) -> InferenceClient:

@@ -282,8 +282,12 @@ def resolve_role_api_key(config: Any, *preferred_names: str) -> str | None:
     )
 
 
-# Default oMLX OCR model. The vLLM path uses the single model served by Spark.
+# Default oMLX models per role. The vLLM path uses the single model served by
+# Spark for both roles; on Apple Silicon the roles are normally two different
+# checkpoints, because a vision model is wasted on text reasoning and a text
+# model cannot see frames at all.
 RECOMMENDED_OCR_MODEL = "Qwen3.6-27B-bf16"
+RECOMMENDED_TEXT_MODEL = "DeepSeek-V4-Flash-0731-MLX"
 
 
 def resolve_ocr_model(config) -> str:
@@ -312,7 +316,7 @@ def resolve_llm_model(config) -> str:
     return (
         getattr(config, "model", None)
         or _env_value("LLM_MODEL", "MLX_MODEL", "OMLX_MODEL")
-        or "default"
+        or RECOMMENDED_TEXT_MODEL
     )
 
 
