@@ -198,7 +198,7 @@ def test_ocr_disables_thinking_in_request_payload(monkeypatch, tmp_path):
         captured["payload"] = json.loads(req.data.decode("utf-8"))
         return FakeResponse()
 
-    monkeypatch.setattr(omlx_client.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(omlx_client, "_urlopen", fake_urlopen)
 
     ocr = VerbatimOCR(OCRConfig(model="Qwen3-VL-test", disable_thinking=True))
     assert ocr.ocr_frame(str(img_path)) == "hello"
@@ -242,7 +242,7 @@ def test_cleanup_falls_back_to_raw_when_llm_drops_content(monkeypatch):
                 {"choices": [{"message": {"content": "keep_line_0 = 0"}}]}
             ).encode()
 
-    monkeypatch.setattr(omlx_client.request, "urlopen", lambda req, timeout: FakeResponse())
+    monkeypatch.setattr(omlx_client, "_urlopen", lambda req, timeout: FakeResponse())
 
     cfg = ScreenLensConfig()
     out = T._cleanup_transcript(raw, cfg)
@@ -265,3 +265,16 @@ def test_select_frames_on_real_video(tmp_path):
     # timestamps strictly increasing
     ts = [m["timestamp"] for m in meta]
     assert ts == sorted(ts)
+
+
+def test_transcribe_reports_degenerate_frames_without_editing_them():
+    """A frame where the OCR model got stuck must be flagged, not trimmed —
+    the raw transcript is defined as byte-faithful to what the model read."""
+    from src.omlx_client import degenerate_repetition
+
+    stuck = "INSERT INTO t VALUES ('a', 'b');\n" + "!" * 400
+    assert degenerate_repetition(stuck) == "!"
+
+    # A screen that genuinely repeats whole statements is not "stuck".
+    faithful = "INSERT INTO t VALUES (1, 'abc', 'def');\n" * 20
+    assert degenerate_repetition(faithful) is None

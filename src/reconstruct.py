@@ -27,11 +27,12 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
 from .config import ScreenLensConfig
-from .omlx_client import OMLXClient, resolve_omlx_model
+from .omlx_client import InferenceClient, InferenceTruncatedError
+from .session import text_role_captioning_config
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
-from .pipeline import _compute_chunk_strategy
+from .pipeline import _chunk_captions_by_budget, _compute_chunk_strategy
 
 logger = logging.getLogger("screenlens.reconstruct")
 
@@ -47,14 +48,24 @@ CONTENT_TYPES = {
 
 MAX_QA_ITERATIONS = 3
 
-# Cap on captions per Pass-1 extraction chunk. ``_compute_chunk_strategy``
-# maximizes chunk size to minimize chunk count, which on a model with a
-# very large context window (e.g. Qwen3.5-122B at ~256k tokens) yields
-# chunks of 200+ captions. Each chunk only gets ~2k output tokens of
-# extraction notes, so oversized chunks force the client into aggressive
-# compression and lose specifics. This cap keeps extraction fidelity
-# bounded regardless of model context size.
+# Fidelity cap in addition to the serialized-size budget. On a model with a
+# very large context window, hundreds of short captions may technically fit,
+# but one oversized extraction prompt would leave too little of that window
+# for a detailed response and force the model to compress away specifics.
 MAX_CAPTIONS_PER_CHUNK = 50
+
+# Long-form calls may consume the client's full configured completion ceiling.
+# Pass 2 separately reserves part of the context while planning its input, and
+# intermediate condensation requests a smaller target while retaining the full
+# server context as headroom; recursion is guarded by measured size reduction.
+MIN_RECONSTRUCTION_OUTPUT_TOKENS = 256
+MIN_SYNTHESIS_INPUT_TOKENS = 2048
+SYNTHESIS_OUTPUT_RESERVE_RATIO = 0.25
+SEGMENT_NOTE_TARGET_TOKENS = 1400
+INTERMEDIATE_TARGET_RATIO = 0.3
+INTERMEDIATE_TARGET_MAX_TOKENS = 4096
+MAX_SYNTHESIS_DEPTH = 8
+SYNTHESIS_OVERHEAD_TOKENS = 2548
 
 
 # ── System Prompts ───────────────────────────────────────────────────────────
@@ -242,33 +253,51 @@ class ReconstructState(TypedDict, total=False):
 _MODEL_CACHE: dict = {}
 
 
-def get_inference_client(config: ScreenLensConfig) -> OMLXClient:
-    """Create/cache the configured oMLX client for reuse across all nodes."""
+def _reconstruction_captioning_config(config: ScreenLensConfig):
+    """Return the TEXT-role client config for reconstruction planning/QA.
+
+    Reconstruction never looks at frames — it reasons over captions — so it runs
+    on ``config.reconstruction`` (the text model), not the vision model that
+    produced those captions. That also applies the reconstruction timeout, which
+    artifact synthesis needs: it is a far longer generation than one caption.
+    On DGX Spark both roles resolve to the same served vLLM checkpoint, so the
+    model choice is a no-op there.
+    """
+    return text_role_captioning_config(config)
+
+
+def get_inference_client(config: ScreenLensConfig) -> InferenceClient:
+    """Create/cache the configured direct client for reuse across all nodes."""
+    direct_config = _reconstruction_captioning_config(config)
+    client = InferenceClient(direct_config)
     key = (
-        "omlx",
-        config.captioning.omlx_base_url,
-        resolve_omlx_model(config.captioning),
+        client.backend.value,
+        client.base_url,
+        client.model,
+        client.api_key,
+        client.timeout,
     )
     if key not in _MODEL_CACHE:
-        client = OMLXClient(config.captioning)
-        print(f"Using oMLX model: {client.model} at {client.base_url}")
+        print(f"Using {client.backend.value} model: {client.model} at {client.base_url}")
         _MODEL_CACHE[key] = client
     return _MODEL_CACHE[key]
 
 
 def generate_text(
-    client: OMLXClient,
+    client: InferenceClient,
     system: str,
     user: str,
-    max_tokens: int = 4096,
+    max_tokens: int | None = None,
     temperature: float = 0.2,
 ) -> str:
-    """Generate text using the configured oMLX client."""
+    """Generate text using the configured direct inference client."""
     return client.chat(
         system,
         user,
         max_tokens=max_tokens,
         temperature=temperature,
+        extra={"chat_template_kwargs": {"enable_thinking": False}},
+        require_complete=True,
     )
 
 
@@ -333,14 +362,61 @@ def _stratified_sample(items: list, n: int) -> list:
     return [items[int(round(i * step))] for i in range(n)]
 
 
-def _chunk_list(items: list, chunk_size: int) -> list[list]:
-    """Split items into contiguous chunks of at most ``chunk_size``."""
-    return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+def _estimated_text_tokens(text: str) -> int:
+    """Estimate serialized note cost, including a separator allowance."""
+    return max(1, (len(text) + 1) // 2) + 50
+
+
+def _chunk_texts_by_budget(items: list[str], token_budget: int) -> list[list[str]]:
+    """Greedily group notes by size and split an individually oversized note."""
+    if token_budget <= 50:
+        raise ValueError(f"Text token budget is too small: {token_budget}")
+    max_text_chars = max(1, (token_budget - 50) * 2)
+    units = [
+        text[start : start + max_text_chars]
+        for text in items
+        for start in range(0, max(len(text), 1), max_text_chars)
+    ]
+    groups: list[list[str]] = []
+    current: list[str] = []
+    current_tokens = 0
+    for text in units:
+        text_tokens = _estimated_text_tokens(text)
+        if current and current_tokens + text_tokens > token_budget:
+            groups.append(current)
+            current = []
+            current_tokens = 0
+        current.append(text)
+        current_tokens += text_tokens
+    if current:
+        groups.append(current)
+    return groups
 
 
 def _get_model_context_size(client) -> int:
-    """Return the configured oMLX context window used for chunk planning."""
-    return client.config.omlx_model_context
+    """Return the configured context window used for chunk planning."""
+    return client.context_size
+
+
+def _long_form_output_ceiling(client, model_context: int) -> int:
+    """Use the server's full context as the reconstruction completion ceiling.
+
+    Passing the context ceiling to ``InferenceClient`` deliberately makes its
+    vLLM path omit a literal ``max_tokens`` field, so vLLM assigns the exact
+    space remaining after each rendered prompt. This follows a server upgrade
+    automatically (for example, from 32K to Qwen3.6's native 262K context)
+    without retaining the captioning path's smaller configured output default.
+    """
+    return max(1, int(model_context))
+
+
+def _synthesis_output_reserve(output_ceiling: int, model_context: int) -> int:
+    """Reserve output room for prompt planning without capping final output."""
+    context_reserve = int(model_context * SYNTHESIS_OUTPUT_RESERVE_RATIO)
+    return max(
+        MIN_RECONSTRUCTION_OUTPUT_TOKENS,
+        min(output_ceiling, max(MIN_RECONSTRUCTION_OUTPUT_TOKENS, context_reserve)),
+    )
 
 
 def _extract_segment_notes(
@@ -350,10 +426,11 @@ def _extract_segment_notes(
 ) -> list[str]:
     """Pass 1 of hierarchical reconstruction: extract content notes per chunk.
 
-    Uses ``_compute_chunk_strategy`` to size chunks against the model's
-    context window. Each chunk gets a single oMLX call producing structured
-    extraction notes (raw content, no synthesis). The result is a list of
-    notes — one per chunk — that downstream synthesis passes consume.
+    Uses ``_compute_chunk_strategy`` for the safe input budget, then greedily
+    packs each serialized caption by size. Each chunk gets a single inference
+    call producing structured extraction notes (raw content, no synthesis).
+    The result is a list of notes — one per chunk — that downstream synthesis
+    passes consume.
 
     Task-agnostic by design: the same extraction is reused across all tasks
     in a single iteration AND across QA retries (cached in state). This
@@ -361,38 +438,25 @@ def _extract_segment_notes(
     synthesis prompt changes.
     """
     strategy = _compute_chunk_strategy(captions, model_context)
+    output_ceiling = _long_form_output_ceiling(client, model_context)
+    chunks = _chunk_captions_by_budget(
+        captions,
+        strategy["safe_context_tokens"],
+        max_captions=MAX_CAPTIONS_PER_CHUNK,
+    )
+    extraction_strategy = "single_pass" if len(chunks) <= 1 else "hierarchical"
+    max_chunk_size = max((len(chunk) for chunk in chunks), default=0)
 
-    # Cap chunk_size for fidelity (see MAX_CAPTIONS_PER_CHUNK comment).
-    if (strategy["strategy"] == "hierarchical"
-            and strategy["chunk_size"] > MAX_CAPTIONS_PER_CHUNK):
-        strategy["chunk_size"] = MAX_CAPTIONS_PER_CHUNK
-        strategy["num_chunks"] = -(-len(captions) // MAX_CAPTIONS_PER_CHUNK)
+    print(f"    [Pass 1] strategy={extraction_strategy} "
+          f"max_chunk_size={max_chunk_size} "
+          f"chunks={len(chunks)} "
+          f"note_target<={SEGMENT_NOTE_TARGET_TOKENS:,} "
+          f"context_ceiling={output_ceiling:,}")
 
-    print(f"    [Pass 1] strategy={strategy['strategy']} "
-          f"chunk_size={strategy['chunk_size']} "
-          f"chunks={strategy['num_chunks']}")
-
-    if strategy["strategy"] == "single_pass":
-        # Whole recording fits in one call. Still use the extraction prompt so
-        # the downstream synthesis pipeline sees a uniform input format.
-        all_block = "\n\n---\n\n".join(
-            f"[{c.get('timestamp_str', '?')}]\n{c.get('caption', '')}"
-            for c in captions
-        )
-        user = (
-            f"Frame captions covering the entire recording "
-            f"({len(captions)} frames):\n\n{all_block}"
-        )
-        notes = generate_text(
-            client, EXTRACT_SEGMENT_SYSTEM, user,
-            max_tokens=4096, temperature=0.1,
-        )
-        return [f"[Full recording]\n{notes}"]
-
-    chunks = _chunk_list(captions, strategy["chunk_size"])
     segment_notes: list[str] = []
 
-    for i, chunk in enumerate(chunks, 1):
+    def extract_chunk(chunk: list[dict], label: str) -> list[str]:
+        """Extract one bounded note, splitting the input if the model overruns."""
         start_ts = chunk[0].get("timestamp_str", "?")
         end_ts = chunk[-1].get("timestamp_str", "?")
 
@@ -401,23 +465,62 @@ def _extract_segment_notes(
             for c in chunk
         )
         user = (
-            f"Segment {i} of {len(chunks)} from a longer recording "
+            f"Segment {label} of {len(chunks)} from a recording "
             f"(timestamps {start_ts} — {end_ts}, {len(chunk)} frames). "
-            f"Extract every concrete detail from this segment that could be "
-            f"needed to reconstruct the artifacts shown in the recording.\n\n"
+            "Produce dense evidence notes for later artifact reconstruction. "
+            "Preserve exact visible source text, filenames, values, and final-state "
+            "changes. Consolidate repeated observations and omit routine UI chrome, "
+            "navigation, and descriptions that add no artifact content. "
+            f"Keep the response at or below {SEGMENT_NOTE_TARGET_TOKENS:,} tokens.\n\n"
             f"SEGMENT CAPTIONS:\n\n{chunk_block}"
         )
         t0 = time.time()
-        notes = generate_text(
-            client, EXTRACT_SEGMENT_SYSTEM, user,
-            max_tokens=2048, temperature=0.1,
-        )
+        try:
+            notes = generate_text(
+                client, EXTRACT_SEGMENT_SYSTEM, user,
+                max_tokens=output_ceiling, temperature=0.1,
+            )
+        except InferenceTruncatedError as exc:
+            if len(chunk) <= 1:
+                raise RuntimeError(
+                    "Segment-note extraction could not produce a complete bounded "
+                    f"response for the frame at {start_ts}."
+                ) from exc
+            midpoint = len(chunk) // 2
+            print(f"    [Pass 1] segment {label} exhausted the full "
+                  f"{output_ceiling:,}-token context; retrying as two smaller "
+                  "caption groups")
+            return (
+                extract_chunk(chunk[:midpoint], f"{label}a")
+                + extract_chunk(chunk[midpoint:], f"{label}b")
+            )
         elapsed = time.time() - t0
-        segment_notes.append(f"[Segment {i}: {start_ts} — {end_ts}]\n{notes}")
-        print(f"    [Pass 1] segment {i}/{len(chunks)} done "
+        heading = (
+            "[Full recording]"
+            if len(chunks) == 1 and label == "1"
+            else f"[Segment {label}: {start_ts} — {end_ts}]"
+        )
+        print(f"    [Pass 1] segment {label}/{len(chunks)} done "
               f"({len(notes)} chars, {elapsed:.1f}s)")
+        return [f"{heading}\n{notes}"]
+
+    for i, chunk in enumerate(chunks, 1):
+        segment_notes.extend(extract_chunk(chunk, str(i)))
 
     return segment_notes
+
+
+def _intermediate_target_tokens(
+    group_tokens: int,
+) -> int:
+    """Return the requested task-focused note target for a source group."""
+    return max(
+        MIN_RECONSTRUCTION_OUTPUT_TOKENS * 2,
+        min(
+            INTERMEDIATE_TARGET_MAX_TOKENS,
+            int(group_tokens * INTERMEDIATE_TARGET_RATIO),
+        ),
+    )
 
 
 def _hierarchical_synthesize(
@@ -426,7 +529,9 @@ def _hierarchical_synthesize(
     task_system_prompt: str,
     client,
     model_context: int,
-    max_output_tokens: int = 32768,
+    max_output_tokens: int | None = None,
+    *,
+    _depth: int = 0,
 ) -> str:
     """Pass 2 of hierarchical reconstruction: synthesize segment notes into a
     final artifact, recursing if the notes don't all fit in one call.
@@ -435,19 +540,32 @@ def _hierarchical_synthesize(
     Otherwise: group notes into super-chunks, run an intermediate synthesis
     on each (using EXTRACT_SEGMENT_SYSTEM to preserve detail rather than
     finalize), then recurse on the intermediate notes. The recursion is
-    guaranteed to terminate because each pass strictly reduces the total
-    token count (by collapsing several detailed notes into one denser note).
+    guarded against non-termination by requiring each condensation pass to
+    reduce the estimated note size and by enforcing a maximum recursion depth.
     """
-    OVERHEAD_TOKENS = 2548  # system prompt + chat template + safety margin
+    if _depth >= MAX_SYNTHESIS_DEPTH:
+        raise RuntimeError(
+            "Reconstruction synthesis exceeded its maximum condensation depth; "
+            "the model is not reducing the intermediate notes enough to fit."
+        )
+
+    if max_output_tokens is None:
+        max_output_tokens = _long_form_output_ceiling(client, model_context)
+    else:
+        max_output_tokens = max(1, min(max_output_tokens, model_context))
+
+    # This reserve only controls how much input a synthesis prompt may pack.
+    # The actual final call still receives the full configured ceiling; vLLM
+    # then allocates the exact context remaining after the prompt.
+    output_reserve = _synthesis_output_reserve(max_output_tokens, model_context)
     safe_input_tokens = max(
-        2048,
-        int((model_context - OVERHEAD_TOKENS - max_output_tokens) * 0.85),
+        MIN_SYNTHESIS_INPUT_TOKENS,
+        int((model_context - SYNTHESIS_OVERHEAD_TOKENS - output_reserve) * 0.85),
     )
 
-    total_chars = sum(len(n) + 50 for n in notes)  # +50 per separator
-    estimated_tokens = total_chars // 4
+    estimated_tokens = sum(_estimated_text_tokens(note) for note in notes)
 
-    if estimated_tokens <= safe_input_tokens or len(notes) <= 1:
+    if estimated_tokens <= safe_input_tokens:
         # Single synthesis pass — all notes fit
         notes_block = "\n\n---\n\n".join(notes)
         user = (
@@ -463,48 +581,82 @@ def _hierarchical_synthesize(
             max_tokens=max_output_tokens, temperature=0.1,
         )
 
-    # Recursive group-and-condense. Choose a group size that leaves headroom
-    # for the intermediate synthesis output, then recurse on the result.
-    avg_chars_per_note = total_chars / len(notes)
-    notes_per_group = max(
-        2,
-        int((safe_input_tokens * 4) / avg_chars_per_note * 0.7),
-    )
+    # Recursive group-and-condense. Budget each serialized note independently;
+    # a fixed count derived from the average fails when one note is an outlier.
+    groups = _chunk_texts_by_budget(notes, safe_input_tokens)
+    max_group_size = max((len(group) for group in groups), default=0)
 
     print(f"    [Pass 2] {len(notes)} notes (~{estimated_tokens:,} tok) "
-          f"exceed budget — recursing in groups of {notes_per_group}")
+          f"exceed budget — recursing in {len(groups)} size-budgeted groups "
+          f"(max {max_group_size} notes)")
 
-    groups = _chunk_list(notes, notes_per_group)
-    intermediate_notes: list[str] = []
-
-    for i, group in enumerate(groups, 1):
+    def condense_group(
+        group: list[str],
+        section_label: str,
+        retry_depth: int = 0,
+    ) -> list[str]:
+        """Produce task-focused notes, splitting and retrying any overrun."""
+        group_tokens = sum(_estimated_text_tokens(note) for note in group)
+        target_tokens = _intermediate_target_tokens(group_tokens)
         group_block = "\n\n---\n\n".join(group)
         intermediate_user = (
-            f"You are merging extraction notes from one section of a longer "
-            f"recording (section {i} of {len(groups)}). Produce dense "
-            f"intermediate notes that consolidate and preserve the concrete "
-            f"information from this section. These notes will be combined with "
-            f"intermediate notes from other sections in a later pass — do not "
-            f"finalize the artifact, do not summarize, do not drop specifics.\n\n"
-            f"PRESERVE: text content, code, file names, UI labels, timestamps, "
-            f"user inputs, system outputs, configuration values.\n\n"
+            f"You are filtering section {section_label} of extraction notes for "
+            "one reconstruction task. Produce dense intermediate notes containing "
+            "every concrete fact needed for the task below. Consolidate duplicates "
+            "and discard material solely about other files/artifacts, routine UI "
+            "navigation, and repeated descriptions. Do not finalize the artifact.\n\n"
+            f"TASK FOCUS:\n{task_user_prefix}\n\n"
+            f"TARGET LENGTH: at most {target_tokens:,} tokens.\n\n"
             f"SECTION NOTES:\n\n{group_block}"
         )
         t0 = time.time()
-        result = generate_text(
-            client, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
-            max_tokens=2048, temperature=0.1,
-        )
-        intermediate_notes.append(f"[Section {i} of {len(groups)}]\n{result}")
+        try:
+            result = generate_text(
+                client, EXTRACT_SEGMENT_SYSTEM, intermediate_user,
+                max_tokens=max_output_tokens, temperature=0.1,
+            )
+        except InferenceTruncatedError as exc:
+            retry_budget = max(MIN_SYNTHESIS_INPUT_TOKENS, group_tokens // 2)
+            subgroups = _chunk_texts_by_budget(group, retry_budget)
+            if retry_depth >= MAX_SYNTHESIS_DEPTH or len(subgroups) <= 1:
+                raise RuntimeError(
+                    "Task-focused reconstruction notes still exceeded their "
+                    f"completion cap after input splitting (section {section_label})."
+                ) from exc
+            print(f"    [Pass 2] intermediate {section_label} exhausted the "
+                  f"full {max_output_tokens:,}-token context; retrying in "
+                  f"{len(subgroups)} smaller groups")
+            retried: list[str] = []
+            for index, subgroup in enumerate(subgroups, 1):
+                retried.extend(condense_group(
+                    subgroup,
+                    f"{section_label}.{index}",
+                    retry_depth + 1,
+                ))
+            return retried
         elapsed = time.time() - t0
-        print(f"    [Pass 2] intermediate {i}/{len(groups)} done "
-              f"({len(result)} chars, {elapsed:.1f}s)")
+        print(f"    [Pass 2] intermediate {section_label} done "
+              f"({len(result)} chars, target<={target_tokens:,}, {elapsed:.1f}s)")
+        return [f"[Section {section_label}]\n{result}"]
 
-    # Recurse — guaranteed to terminate because intermediate notes are denser
-    # than the inputs (capped at 2048 output tokens vs many more input tokens).
+    intermediate_notes: list[str] = []
+    for i, group in enumerate(groups, 1):
+        intermediate_notes.extend(condense_group(group, f"{i}/{len(groups)}"))
+
+    next_estimated_tokens = sum(
+        _estimated_text_tokens(note) for note in intermediate_notes
+    )
+    if next_estimated_tokens >= estimated_tokens:
+        raise RuntimeError(
+            "Reconstruction condensation made no progress "
+            f"(~{estimated_tokens:,} input tokens -> "
+            f"~{next_estimated_tokens:,} output tokens). The model did not "
+            "follow the dense-intermediate-notes instruction."
+        )
+
     return _hierarchical_synthesize(
         intermediate_notes, task_user_prefix, task_system_prompt,
-        client, model_context, max_output_tokens,
+        client, model_context, max_output_tokens, _depth=_depth + 1,
     )
 
 
@@ -588,8 +740,13 @@ def plan_node(state: ReconstructState) -> dict:
         sampled = _stratified_sample(captions, 60)
         sample_block = _build_caption_block(sampled, max_chars=80000)
         file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
+        # The file list is unbounded — one entry per Python file visible, each
+        # with a description and key_content — so it cannot share the classifier's
+        # small fixed cap. Let the model run to its natural stop.
+        plan_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
         response = generate_text(client, PLAN_PYTHON_SYSTEM,
-                                  file_id_prompt, max_tokens=1024, temperature=0.1)
+                                  file_id_prompt, max_tokens=plan_ceiling,
+                                  temperature=0.1)
         plan = parse_json_response(response)
 
         files = plan.get("files", [{"filename": "reconstructed.py",
@@ -849,8 +1006,11 @@ def qa_reflect_node(state: ReconstructState) -> dict:
         f"RECONSTRUCTED ARTIFACTS:\n{artifacts_text}"
     )
 
+    # feedback + per-artifact scores + missing_elements grow with the artifact
+    # set, so this JSON has no small fixed bound either.
+    qa_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
     response = generate_text(client, QA_REFLECT_SYSTEM, user_prompt,
-                              max_tokens=1024, temperature=0.1)
+                              max_tokens=qa_ceiling, temperature=0.1)
     result = parse_json_response(response)
 
     passed = result.get("passed", True)
@@ -956,7 +1116,7 @@ def route_to_workers(state: ReconstructState):
     """Dispatch reconstruction tasks sequentially.
 
     Keep reconstruction deterministic by processing tasks in order. The
-    expensive work is delegated to the oMLX server, which handles its own
+    expensive work is delegated to the inference server, which handles its own
     scheduling and batching.
     """
     tasks = state.get("reconstruction_tasks", [])

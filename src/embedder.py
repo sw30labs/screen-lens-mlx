@@ -4,6 +4,7 @@ CLIP Embedding Module.
 Generates visual and text embeddings using OpenCLIP for semantic search.
 Supports both image embedding (for frames) and text embedding (for queries).
 """
+import logging
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,13 @@ from typing import Optional
 from tqdm import tqdm
 
 from .config import EmbeddingConfig
+
+
+class _PublicHubAuthWarningFilter(logging.Filter):
+    """Hide Hugging Face's advisory warning for public OpenCLIP weights."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "unauthenticated requests to the HF Hub" not in record.getMessage()
 
 
 class CLIPEmbedder:
@@ -43,11 +51,21 @@ class CLIPEmbedder:
         self.config.device = device
 
         print(f"Loading OpenCLIP model {self.config.model_name} on {device}...")
-        self._model, _, self._preprocess = open_clip.create_model_and_transforms(
-            self.config.model_name,
-            pretrained=self.config.pretrained,
-            device=device,
-        )
+        # The configured checkpoint is public. Newer Hub servers emit an
+        # advisory warning (often twice under TUI log forwarding) without a
+        # token even though the download is valid. Actual download, auth, and
+        # rate-limit failures still propagate normally.
+        hub_logger = logging.getLogger("huggingface_hub.utils._http")
+        auth_filter = _PublicHubAuthWarningFilter()
+        hub_logger.addFilter(auth_filter)
+        try:
+            self._model, _, self._preprocess = open_clip.create_model_and_transforms(
+                self.config.model_name,
+                pretrained=self.config.pretrained,
+                device=device,
+            )
+        finally:
+            hub_logger.removeFilter(auth_filter)
         self._tokenizer = open_clip.get_tokenizer(self.config.model_name)
         self._model.eval()
         print("CLIP model loaded.")
@@ -81,7 +99,7 @@ class CLIPEmbedder:
                     images.append(self._preprocess(Image.new("RGB", (224, 224))))
 
             batch_tensor = torch.stack(images).to(device)
-            with torch.no_grad():
+            with torch.inference_mode():
                 features = self._model.encode_image(batch_tensor)
                 features = features / features.norm(dim=-1, keepdim=True)
                 all_embeddings.append(features.cpu().numpy())
@@ -100,7 +118,7 @@ class CLIPEmbedder:
         device = self.config.device
 
         tokens = self._tokenizer(queries).to(device)
-        with torch.no_grad():
+        with torch.inference_mode():
             features = self._model.encode_text(tokens)
             features = features / features.norm(dim=-1, keepdim=True)
 

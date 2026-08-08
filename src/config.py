@@ -3,10 +3,51 @@ Configuration for the ScreenLens pipeline.
 All settings are centralized here for easy tuning.
 """
 from enum import Enum
+import os
+import platform
+import re
 from pathlib import Path
 from typing import Optional
 
 from pydantic import BaseModel, Field
+
+
+_DOTENV_LOADED = False
+
+
+def load_dotenv_if_present() -> None:
+    """Load literal ``KEY=value`` entries without overriding shell exports."""
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+
+    repo_root = Path(__file__).resolve().parents[1]
+    candidates = [Path.cwd() / ".env", repo_root / ".env"]
+    seen: set[Path] = set()
+    for env_path in candidates:
+        env_path = env_path.resolve()
+        if env_path in seen or not env_path.exists():
+            continue
+        seen.add(env_path)
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].lstrip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+                continue
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+                value = value[1:-1]
+            else:
+                value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
+            os.environ.setdefault(key, value)
 
 
 # ── Frame Extraction ────────────────────────────────────────────────────────
@@ -40,17 +81,98 @@ class FrameExtractionConfig(BaseModel):
 
 # ── Captioning ──────────────────────────────────────────────────────────────
 
+def is_dgx_spark_host() -> bool:
+    """Return whether platform defaults should target NVIDIA DGX Spark."""
+    return platform.system() == "Linux" and platform.machine().lower() in {
+        "aarch64",
+        "arm64",
+    }
+
+
+class InferenceBackend(str, Enum):
+    """Direct OpenAI-compatible inference servers supported by ScreenLens."""
+    vllm = "vllm"
+    omlx = "omlx"
+
+
 class CaptionBackend(str, Enum):
     """Which vision model backend to use for captioning."""
+    vllm = "vllm"           # vLLM OpenAI-compatible server (DGX Spark)
     omlx = "omlx"           # oMLX OpenAI-compatible server (Apple Silicon native)
     ollama = "ollama"       # Any Ollama vision model (llama3.2-vision, etc.)
+
+
+def default_inference_backend() -> InferenceBackend:
+    """Choose the native direct server, with an explicit env override."""
+    load_dotenv_if_present()
+    configured = os.getenv("SCREENLENS_BACKEND", "").strip().lower()
+    if configured and configured != CaptionBackend.ollama.value:
+        return InferenceBackend(configured)
+    return InferenceBackend.vllm if is_dgx_spark_host() else InferenceBackend.omlx
+
+
+def default_caption_backend() -> CaptionBackend:
+    """Choose vLLM on DGX Spark and oMLX elsewhere unless overridden."""
+    load_dotenv_if_present()
+    configured = os.getenv("SCREENLENS_BACKEND", "").strip().lower()
+    if configured:
+        return CaptionBackend(configured)
+    return CaptionBackend.vllm if is_dgx_spark_host() else CaptionBackend.omlx
+
+
+def default_inference_concurrency() -> int:
+    """Match the conservative two-sequence DGX Spark serving recipe."""
+    load_dotenv_if_present()
+    configured = os.getenv("SCREENLENS_BATCH_SIZE", "").strip()
+    if configured:
+        try:
+            return max(1, int(configured))
+        except ValueError:
+            pass
+    return 2 if is_dgx_spark_host() else 4
+
+
+def default_embedding_device() -> str:
+    """Choose the native accelerator without importing torch at config time."""
+    load_dotenv_if_present()
+    configured = os.getenv("SCREENLENS_DEVICE", "").strip().lower()
+    if configured:
+        return configured
+    if is_dgx_spark_host():
+        return "cuda"
+    if platform.system() == "Darwin" and platform.machine().lower() in {"arm64", "aarch64"}:
+        return "mps"
+    return "cpu"
 
 
 class CaptioningConfig(BaseModel):
     """Settings for frame captioning."""
     backend: CaptionBackend = Field(
-        default=CaptionBackend.omlx,
-        description="Vision model backend: 'omlx' (recommended on Apple Silicon) or 'ollama'"
+        default_factory=default_caption_backend,
+        description=(
+            "Vision backend: 'vllm' (DGX Spark), 'omlx' (Apple Silicon), or 'ollama'"
+        ),
+    )
+    # vLLM settings (OpenAI-compatible DGX Spark server)
+    vllm_base_url: str = Field(
+        default="http://127.0.0.1:8000/v1",
+        description="vLLM OpenAI-compatible API base URL",
+    )
+    vllm_model: Optional[str] = Field(
+        default=None,
+        description="vLLM model id; defaults to VLLM_MODEL then the DGX Spark model",
+    )
+    vllm_api_key: Optional[str] = Field(
+        default=None,
+        description="vLLM API key; defaults to VLLM_API_KEY or a local placeholder",
+    )
+    vllm_timeout_seconds: float = Field(
+        default=600.0,
+        description="HTTP timeout for vLLM generation requests",
+    )
+    vllm_model_context: int = Field(
+        default=32768,
+        description="Configured vLLM context window used for chunk planning",
     )
     # oMLX settings (OpenAI-compatible local server)
     omlx_base_url: str = Field(
@@ -78,18 +200,46 @@ class CaptioningConfig(BaseModel):
     ollama_base_url: str = Field(default="http://127.0.0.1:11434", description="Ollama API endpoint")
     # Shared generation settings
     temperature: float = Field(default=0.1, description="LLM temperature for captions")
-    max_tokens: int = Field(default=32768, description="Max tokens per caption")
-    batch_size: int = Field(
-        default=4,
+    max_tokens: int = Field(
+        default=32768,
         description=(
-            "Frames per captioning chunk. For oMLX this is the number of concurrent "
-            "OpenAI-compatible requests. Ignored by Ollama."
+            "Requested output-token ceiling per caption. When this reaches the "
+            "served vLLM context size, ScreenLens lets vLLM use all context "
+            "remaining after the prompt and image."
+        ),
+    )
+    retry_attempts: int = Field(
+        default=1,
+        ge=0,
+        description="Per-frame retries after a direct caption request fails",
+    )
+    retry_max_tokens: int = Field(
+        default=2048,
+        ge=1,
+        description=(
+            "Bounded output-token ceiling for a retried caption request, used to "
+            "prevent a malformed generation from consuming the full normal budget"
+        ),
+    )
+    repetition_penalty: float = Field(
+        default=1.05,
+        description="Lightly discourage degenerate long-form caption repetition",
+    )
+    no_repeat_ngram_size: int = Field(
+        default=12,
+        description="Block long repeated caption loops (0 disables)",
+    )
+    batch_size: int = Field(
+        default_factory=default_inference_concurrency,
+        description=(
+            "Frames per chunk / concurrent OpenAI-compatible requests. Defaults "
+            "to 2 on DGX Spark to match the bundled vLLM service."
         ),
     )
     disable_thinking: bool = Field(
         default=True,
         description=(
-            "Disable model reasoning for oMLX captions so Qwen-style models spend "
+            "Disable model reasoning for OpenAI-compatible captions so Qwen models spend "
             "their token budget on the visible answer instead of hidden thinking."
         ),
     )
@@ -154,19 +304,27 @@ OCR_USER_PROMPT = (
 
 class OCRConfig(BaseModel):
     """Settings for the verbatim OCR pass (vision model required)."""
-    # oMLX OpenAI-compatible vision server
+    backend: InferenceBackend = Field(
+        default_factory=default_inference_backend,
+        description="OpenAI-compatible vision server: vllm or omlx",
+    )
+    # OpenAI-compatible vision server
     base_url: str = Field(
         default="http://127.0.0.1:8000/v1",
-        description="oMLX OpenAI-compatible API base URL (dashboard/root URLs are normalized)",
+        description="OpenAI-compatible API base URL (dashboard/root URLs are normalized)",
     )
     model: Optional[str] = Field(
         default=None,
         description=(
             "Vision model id for OCR. MUST be vision-capable (VL/vision/omni). "
-            "Falls back to OCR_MODEL/MLX_VISION_MODEL env, then a recommended default."
+            "Uses VLLM_OCR_MODEL/VLLM_MODEL on vLLM, or OCR_MODEL/MLX_VISION_MODEL "
+            "on oMLX, before the provider default."
         ),
     )
-    api_key: Optional[str] = Field(default=None, description="oMLX API key (env: OCR_API_KEY/MLX_API_KEY)")
+    api_key: Optional[str] = Field(
+        default=None,
+        description="Inference API key (env: OCR_API_KEY/VLLM_API_KEY/MLX_API_KEY)",
+    )
     timeout_seconds: float = Field(default=600.0, description="HTTP timeout per frame")
     # Generation — tuned for verbatim fidelity, not creativity
     temperature: float = Field(default=0.0, description="0 = deterministic; do not raise for OCR")
@@ -178,7 +336,10 @@ class OCRConfig(BaseModel):
     no_repeat_ngram_size: int = Field(
         default=6, description="Block verbatim n-gram loops (0 disables)"
     )
-    concurrency: int = Field(default=4, description="Concurrent OCR requests to the oMLX server")
+    concurrency: int = Field(
+        default_factory=default_inference_concurrency,
+        description="Concurrent OCR requests (2 by default on DGX Spark)",
+    )
     system_prompt: str = Field(default=OCR_SYSTEM_PROMPT)
     user_prompt: str = Field(default=OCR_USER_PROMPT)
     # Deterministic cross-check (Apple Vision via ocrmac) — optional
@@ -236,6 +397,10 @@ class FrameSelectionConfig(BaseModel):
 
 class ReconstructionConfig(BaseModel):
     """Settings for the optional LLM cleanup/reconstruction pass."""
+    backend: InferenceBackend = Field(
+        default_factory=default_inference_backend,
+        description="OpenAI-compatible text server: vllm or omlx",
+    )
     enabled: bool = Field(
         default=False,
         description=(
@@ -249,10 +414,19 @@ class ReconstructionConfig(BaseModel):
     base_url: str = Field(default="http://127.0.0.1:8000/v1")
     model: Optional[str] = Field(
         default=None,
-        description="Text LLM id (env: LLM_MODEL/MLX_MODEL). MiniMax-M2 etc. are fine here.",
+        description=(
+            "Text model id. Uses VLLM_LLM_MODEL/VLLM_MODEL on vLLM, or "
+            "LLM_MODEL/MLX_MODEL on oMLX."
+        ),
     )
     api_key: Optional[str] = Field(default=None)
-    timeout_seconds: float = Field(default=600.0)
+    timeout_seconds: float = Field(
+        default=1800.0,
+        description=(
+            "HTTP timeout for long-running text reconstruction requests. "
+            "Kept separate from the shorter per-frame caption timeout."
+        ),
+    )
     temperature: float = Field(default=0.0)
     max_tokens: int = Field(default=8192)
     model_context: int = Field(default=32768, description="Assumed context window for chunk planning")
@@ -274,7 +448,10 @@ class EmbeddingConfig(BaseModel):
     model_name: str = Field(default="ViT-B-32", description="OpenCLIP model architecture")
     pretrained: str = Field(default="laion2b_s34b_b79k", description="Pretrained weights")
     batch_size: int = Field(default=64, description="Batch size for embedding generation")
-    device: str = Field(default="mps", description="Device: mps (Apple Silicon), cuda, or cpu")
+    device: str = Field(
+        default_factory=default_embedding_device,
+        description="Device: cuda (DGX Spark), mps (Apple Silicon), or cpu",
+    )
 
 
 # ── Vector DB ───────────────────────────────────────────────────────────────
@@ -291,8 +468,14 @@ class VectorDBConfig(BaseModel):
 class SearchConfig(BaseModel):
     """Settings for search and summarization."""
     top_k: int = Field(default=10, description="Number of results to return")
-    summarization_model: str = Field(default="llama3.2", description="Ollama model for summarization")
-    base_url: str = Field(default="http://127.0.0.1:11434", description="Ollama API endpoint")
+    summarization_model: str = Field(
+        default="llama3.2",
+        description="Fallback model used only when the Ollama backend is selected",
+    )
+    base_url: str = Field(
+        default="http://127.0.0.1:11434",
+        description="Fallback API URL used only when the Ollama backend is selected",
+    )
 
 
 # ── Top-Level Config ────────────────────────────────────────────────────────

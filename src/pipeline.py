@@ -3,7 +3,7 @@ LangGraph ScreenLens Pipeline.
 
 Orchestrates the full ScreenLens workflow:
   1. Ingest — extract keyframes from video (hybrid change detection)
-  2. Caption — generate dense captions (Qwen3.5-VL via oMLX or Ollama)
+  2. Caption — generate dense captions (vLLM, oMLX, or Ollama)
   3. Embed — generate CLIP embeddings for semantic search
   4. Store — persist embeddings + metadata in ChromaDB
   5. Search — semantic query (text → CLIP → vector search)
@@ -21,7 +21,14 @@ from .config import ScreenLensConfig
 from .frame_extractor import extract_frames, get_video_metadata
 from .captioner import caption_frames
 from .embedder import CLIPEmbedder
-from .omlx_client import OMLXClient, resolve_omlx_model
+from .omlx_client import (
+    InferenceClient,
+    InferenceDegenerateError,
+    degenerate_repetition,
+    resolve_inference_context,
+    resolve_inference_model,
+)
+from .session import text_role_captioning_config
 from .vector_store import ScreenLensVectorStore
 
 
@@ -95,8 +102,8 @@ def caption_node(state: ScreenLensState) -> dict:
     output_dir = str(config.data_dir / "captions")
 
     backend = config.captioning.backend.value
-    if backend == "omlx":
-        model_name = resolve_omlx_model(config.captioning).split("/")[-1]
+    if backend in ("vllm", "omlx"):
+        model_name = resolve_inference_model(config.captioning).split("/")[-1]
     else:
         model_name = config.captioning.ollama_model
 
@@ -198,14 +205,6 @@ def summarize_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Generating answer for: '{query}'")
     print(f"{'='*60}")
 
-    from langchain_ollama import ChatOllama
-
-    llm = ChatOllama(
-        model=config.search.summarization_model,
-        base_url=config.search.base_url,
-        temperature=0.3,
-    )
-
     context_parts = []
     for r in results[:config.search.top_k]:
         ts = r.get("timestamp_str", "unknown")
@@ -215,26 +214,34 @@ def summarize_node(state: ScreenLensState) -> dict:
 
     context = "\n\n---\n\n".join(context_parts)
 
-    messages = [
-        (
-            "system",
-            "You are a video analysis assistant. Synthesize a direct answer to the user's "
-            "question by drawing across MULTIPLE frame descriptions — do not echo or "
-            "reformat a single frame verbatim. Identify what is consistent across frames, "
-            "what changes over time, and which timestamps are most relevant. Reference "
-            "specific timestamps for any concrete claim. Be concise and focused on the "
-            "question asked: skip details that are not relevant. Output the answer "
-            "directly — no preamble, no planning notes, no 'let me know if you'd like' "
-            "sign-offs, no meta-commentary.",
-        ),
-        (
-            "human",
-            f"Question: {query}\n\nVideo frame descriptions:\n\n{context}",
-        ),
-    ]
+    system = (
+        "You are a video analysis assistant. Synthesize a direct answer to the user's "
+        "question by drawing across MULTIPLE frame descriptions — do not echo or "
+        "reformat a single frame verbatim. Identify what is consistent across frames, "
+        "what changes over time, and which timestamps are most relevant. Reference "
+        "specific timestamps for any concrete claim. Be concise and focused on the "
+        "question asked: skip details that are not relevant. Output the answer directly "
+        "with no preamble, planning notes, sign-off, or meta-commentary."
+    )
+    user = f"Question: {query}\n\nVideo frame descriptions:\n\n{context}"
 
-    response = llm.invoke(messages)
-    summary = response.content
+    if config.captioning.backend.value == "ollama":
+        from langchain_ollama import ChatOllama
+
+        llm = ChatOllama(
+            model=config.search.summarization_model,
+            base_url=config.search.base_url,
+            temperature=0.3,
+        )
+        summary = llm.invoke([("system", system), ("human", user)]).content
+    else:
+        summary = _inference_text_generate(
+            InferenceClient(text_role_captioning_config(config)),
+            system,
+            user,
+            max_tokens=2048,
+            temperature=0.3,
+        )
 
     elapsed = time.time() - t0
     print(f"\nSummary generated in {elapsed:.1f}s")
@@ -247,73 +254,151 @@ def summarize_node(state: ScreenLensState) -> dict:
     }
 
 
-def _omlx_text_generate(
-    client: OMLXClient,
+def _inference_text_generate(
+    client: InferenceClient,
     system_prompt: str,
     user_prompt: str,
     max_tokens: int = 2048,
     temperature: float = 0.3,
 ) -> str:
-    """Generate text through the configured oMLX server."""
-    return client.chat(
+    """Generate text through the configured OpenAI-compatible server.
+
+    A summary is presented to the user as an answer and written to disk, so a
+    model that has fallen into a repetition loop must not have its output pass
+    for one — report the failure instead of saving it.
+    """
+    text = client.chat(
         system_prompt,
         user_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
+        extra={"chat_template_kwargs": {"enable_thinking": False}},
     )
+    unit = degenerate_repetition(text)
+    if unit is not None:
+        raise InferenceDegenerateError(client.backend.value, client.model, unit)
+    return text
+
+
+# Code, punctuation runs, and malformed repeated output tokenize far more
+# densely than ordinary prose. Two characters per token is deliberately
+# conservative; the client still has an exact /tokenize recovery at the edge.
+_CHARS_PER_TOKEN_ESTIMATE = 2
+_CAPTION_FORMAT_OVERHEAD_TOKENS = 50
+_CHUNK_OVERHEAD_TOKENS = 2548
+_CHUNK_SAFETY_RATIO = 0.8
+
+
+def _estimated_caption_tokens(caption: dict) -> int:
+    """Conservatively estimate one serialized caption's prompt cost."""
+    timestamp = caption.get("timestamp_str", "?")
+    text = caption.get("caption", "")
+    rendered_chars = len(f"[{timestamp}]\n{text}")
+    text_tokens = (
+        rendered_chars + _CHARS_PER_TOKEN_ESTIMATE - 1
+    ) // _CHARS_PER_TOKEN_ESTIMATE
+    return max(1, text_tokens) + _CAPTION_FORMAT_OVERHEAD_TOKENS
+
+
+def _split_oversized_caption(caption: dict, token_budget: int) -> list[dict]:
+    """Split one pathological caption so every piece can be budgeted safely."""
+    timestamp = str(caption.get("timestamp_str", "?"))
+    text = str(caption.get("caption", ""))
+    fixed_chars = len(f"[{timestamp}]\n")
+    usable_tokens = max(1, token_budget - _CAPTION_FORMAT_OVERHEAD_TOKENS)
+    max_text_chars = max(
+        1,
+        usable_tokens * _CHARS_PER_TOKEN_ESTIMATE - fixed_chars,
+    )
+    if len(text) <= max_text_chars:
+        return [caption]
+
+    pieces = []
+    for start in range(0, len(text), max_text_chars):
+        piece = dict(caption)
+        piece["caption"] = text[start : start + max_text_chars]
+        pieces.append(piece)
+    return pieces
+
+
+def _chunk_captions_by_budget(
+    captioned: list[dict],
+    token_budget: int,
+    *,
+    max_captions: int | None = None,
+) -> list[list[dict]]:
+    """Greedily group serialized captions by size instead of global average.
+
+    Caption lengths are highly skewed when a model enters a repetition loop. A
+    fixed caption count can therefore look safe on average while producing one
+    prompt several times larger than the model context. This helper preserves
+    order, splits a single over-budget caption, and bounds both estimated prompt
+    cost and (optionally) captions per chunk.
+    """
+    if token_budget <= _CAPTION_FORMAT_OVERHEAD_TOKENS:
+        raise ValueError(f"Caption token budget is too small: {token_budget}")
+    if max_captions is not None and max_captions < 1:
+        raise ValueError("max_captions must be at least 1")
+
+    units = [
+        piece
+        for caption in captioned
+        for piece in _split_oversized_caption(caption, token_budget)
+    ]
+    chunks: list[list[dict]] = []
+    current: list[dict] = []
+    current_tokens = 0
+
+    for caption in units:
+        caption_tokens = _estimated_caption_tokens(caption)
+        count_full = max_captions is not None and len(current) >= max_captions
+        budget_full = bool(current) and current_tokens + caption_tokens > token_budget
+        if count_full or budget_full:
+            chunks.append(current)
+            current = []
+            current_tokens = 0
+        current.append(caption)
+        current_tokens += caption_tokens
+
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def _compute_chunk_strategy(captioned: list[dict], model_context_tokens: int) -> dict:
     """Compute optimal chunking strategy based on caption stats and model context.
 
     Returns a dict with:
-      chunk_size: number of captions per chunk
+      chunk_size: maximum number of captions in any size-budgeted chunk
+      chunk_sizes: exact caption counts for each chunk
       num_chunks: total chunks
       estimated_tokens_per_chunk: estimated input tokens per Pass 1 call
       strategy: 'single_pass' if everything fits in one call, else 'hierarchical'
     """
-    # Estimate tokens per caption (chars / 4 is a reasonable approximation)
-    caption_lengths = [len(c.get("caption", "")) for c in captioned]
-    avg_caption_chars = sum(caption_lengths) / max(len(caption_lengths), 1)
-    avg_caption_tokens = avg_caption_chars / 4
-    total_tokens = sum(l / 4 for l in caption_lengths)
+    caption_token_estimates = [_estimated_caption_tokens(c) for c in captioned]
+    total_tokens = sum(caption_token_estimates)
+    avg_caption_tokens = total_tokens / max(len(captioned), 1)
 
-    # Reserve tokens for: system prompt (~300), formatting overhead (~200), output (~2048)
-    OVERHEAD_TOKENS = 2548
-    usable_context = model_context_tokens - OVERHEAD_TOKENS
-
-    # Safety margin: use only 80% of usable context to avoid edge-case truncation
-    safe_context = int(usable_context * 0.8)
-
-    # Can everything fit in a single pass?
-    if total_tokens <= safe_context:
-        return {
-            "chunk_size": len(captioned),
-            "num_chunks": 1,
-            "estimated_tokens_per_chunk": int(total_tokens),
-            "total_estimated_tokens": int(total_tokens),
-            "strategy": "single_pass",
-        }
-
-    # Hierarchical: how many captions fit per chunk?
-    # Each caption also has ~50 tokens of timestamp/formatting overhead
-    tokens_per_caption = avg_caption_tokens + 50
-    chunk_size = max(1, int(safe_context / tokens_per_caption))
-
-    # Don't make tiny chunks — minimum 3 captions per chunk
-    chunk_size = max(3, chunk_size)
-
-    num_chunks = -(-len(captioned) // chunk_size)  # ceil division
+    # Reserve system/chat/output overhead, then keep a tokenizer-error margin.
+    usable_context = model_context_tokens - _CHUNK_OVERHEAD_TOKENS
+    safe_context = int(usable_context * _CHUNK_SAFETY_RATIO)
+    chunks = _chunk_captions_by_budget(captioned, safe_context) if captioned else []
+    estimated_per_chunk = [
+        sum(_estimated_caption_tokens(c) for c in chunk)
+        for chunk in chunks
+    ]
+    strategy = "single_pass" if len(chunks) <= 1 else "hierarchical"
 
     return {
-        "chunk_size": chunk_size,
-        "num_chunks": num_chunks,
-        "estimated_tokens_per_chunk": int(chunk_size * tokens_per_caption),
+        "chunk_size": max((len(chunk) for chunk in chunks), default=0),
+        "chunk_sizes": [len(chunk) for chunk in chunks],
+        "num_chunks": len(chunks),
+        "estimated_tokens_per_chunk": max(estimated_per_chunk, default=0),
         "total_estimated_tokens": int(total_tokens),
         "avg_caption_tokens": int(avg_caption_tokens),
         "model_context_tokens": model_context_tokens,
         "safe_context_tokens": safe_context,
-        "strategy": "hierarchical",
+        "strategy": strategy,
     }
 
 
@@ -344,10 +429,12 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     print(f"[SUMMARIZE] Full-video summary from {len(captioned)} frames")
     print(f"{'='*60}")
 
-    # Summarization uses oMLX. Ollama remains a captioning fallback.
-    model = OMLXClient(config.captioning)
-    model_context = config.captioning.omlx_model_context
-    print(f"Using oMLX model: {model.model} at {model.base_url}")
+    # Summarization is text-only reasoning over captions, so it runs on the
+    # TEXT role rather than the vision model that produced them.
+    text_config = text_role_captioning_config(config)
+    model = InferenceClient(text_config)
+    model_context = resolve_inference_context(text_config)
+    print(f"Using {model.backend.value} model: {model.model} at {model.base_url}")
 
     # ── Compute chunking strategy ────────────────────────────────────────
     strategy = _compute_chunk_strategy(captioned, model_context)
@@ -356,12 +443,10 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     print(f"  Total caption tokens: ~{strategy['total_estimated_tokens']:,}")
     print(f"  Strategy: {strategy['strategy']}")
     if strategy["strategy"] == "hierarchical":
-        print(f"  Chunk size: {strategy['chunk_size']} captions/chunk "
-              f"(~{strategy['estimated_tokens_per_chunk']:,} tokens/chunk)")
+        print(f"  Largest chunk: {strategy['chunk_size']} captions "
+              f"(~{strategy['estimated_tokens_per_chunk']:,} estimated tokens)")
         print(f"  Total chunks: {strategy['num_chunks']}")
     print()
-
-    CHUNK_SIZE = strategy["chunk_size"]
 
     # ── Single-pass: everything fits in one call ─────────────────────────
     if strategy["strategy"] == "single_pass":
@@ -392,7 +477,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
             f"Frame descriptions:\n\n{captions_block}"
         )
 
-        summary = _omlx_text_generate(model, system, user, max_tokens=4096)
+        summary = _inference_text_generate(model, system, user, max_tokens=4096)
 
         elapsed = time.time() - t0
         print(f"\nFull-video summary generated in {elapsed:.1f}s")
@@ -406,25 +491,26 @@ def summarize_all_node(state: ScreenLensState) -> dict:
 
     # ── Hierarchical: chunk → summarize → synthesize ─────────────────────
     # Pass 1: Chunk summaries
+    caption_chunks = _chunk_captions_by_budget(
+        captioned,
+        strategy["safe_context_tokens"],
+    )
     chunks = []
-    for i in range(0, len(captioned), CHUNK_SIZE):
-        chunk = captioned[i : i + CHUNK_SIZE]
+    for chunk in caption_chunks:
         chunk_text = []
         for frame in chunk:
             ts = frame.get("timestamp_str", "?")
             caption = frame.get("caption", "")
             chunk_text.append(f"[{ts}]\n{caption}")
-        chunks.append("\n\n---\n\n".join(chunk_text))
+        chunks.append((chunk, "\n\n---\n\n".join(chunk_text)))
 
-    print(f"  Pass 1: Summarizing {len(chunks)} chunks of ~{CHUNK_SIZE} frames each...")
+    print(f"  Pass 1: Summarizing {len(chunks)} size-budgeted chunks...")
 
     chunk_summaries = []
-    for i, chunk_text in enumerate(chunks):
-        start_idx = i * CHUNK_SIZE
-        end_idx = min((i + 1) * CHUNK_SIZE - 1, len(captioned) - 1)
+    for i, (chunk, chunk_text) in enumerate(chunks):
         time_range = (
-            f"{captioned[start_idx].get('timestamp_str', '?')} — "
-            f"{captioned[end_idx].get('timestamp_str', '?')}"
+            f"{chunk[0].get('timestamp_str', '?')} — "
+            f"{chunk[-1].get('timestamp_str', '?')}"
         )
 
         system = (
@@ -435,7 +521,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         )
         user = f"Segment {i+1} ({time_range}):\n\n{chunk_text}"
 
-        response = _omlx_text_generate(model, system, user)
+        response = _inference_text_generate(model, system, user)
         chunk_summaries.append(f"**Segment {i+1} ({time_range}):** {response}")
         print(f"  Chunk {i+1}/{len(chunks)} summarized.")
 
@@ -462,7 +548,7 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         f"Segment summaries:\n\n{all_chunk_summaries}"
     )
 
-    summary = _omlx_text_generate(model, system, user, max_tokens=4096)
+    summary = _inference_text_generate(model, system, user, max_tokens=4096)
 
     elapsed = time.time() - t0
     print(f"\nFull-video summary generated in {elapsed:.1f}s")

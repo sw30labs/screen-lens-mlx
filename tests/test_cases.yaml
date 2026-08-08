@@ -1,241 +1,293 @@
-# Test Cases for ScreenLens Pipeline
-# Used by test_pipeline.py and can be fed to a computer-use agent
-# for automated end-to-end testing.
+# ScreenLens end-to-end scenarios.
+#
+# The test helper can load this file as YAML metadata; the commands are also
+# suitable for a human or computer-use agent. They intentionally avoid fixed
+# output names because ingest/run/transcribe create timestamped folders.
 
 pipeline:
   name: "ScreenLens — Local Video Scene Intelligence"
-  version: "0.1.0"
+  version: "0.2.0"
 
-# ─── Input Configuration ───────────────────────────────────────────────
-input:
-  video_file: "Screen Recording 2026-04-04 at 8.33.55 AM.mov"
-  description: "Screen recording of an application demonstration"
+inputs:
+  video_file: "input-videos/test.mov"
+  description: "A short screen recording with visible terminal or application text"
+  dgx_smoke_image: "assets/ingest-demo.png"
+  dgx_smoke_expected_text: "test.mov"
+  output_glob: "data/test_????????_??????"
 
-# ─── Pipeline Configuration Variants ───────────────────────────────────
+platform_defaults:
+  dgx_spark:
+    match:
+      system: "Linux"
+      machine: ["aarch64", "arm64"]
+    inference_backend: "vllm"
+    embedding_device: "cuda"
+    image_concurrency: 2
+    caption_max_tokens: 32768
+    model: "nvidia/Qwen3.6-27B-NVFP4"
+  apple_silicon:
+    match:
+      system: "Darwin"
+      machine: ["arm64", "aarch64"]
+    inference_backend: "omlx"
+    embedding_device: "mps"
+    image_concurrency: 4
+    caption_max_tokens: 32768
+
+# Valid partial ScreenLensConfig payloads for config-file or agent-generated
+# tests. Provider fields use the names defined in src/config.py.
 configs:
-  fast:
-    description: "Quick test — low FPS, fewer frames"
+  dgx_fast:
+    description: "Small DGX ingestion while exercising vLLM vision and CUDA CLIP"
     frame_extraction:
-      fps: 0.2  # 1 frame every 5 seconds
+      strategy: "fixed_fps"
+      fps: 0.2
       max_dimension: 640
     captioning:
-      model: "llama3.2-vision"
-      max_tokens: 256
+      backend: "vllm"
+      vllm_base_url: "http://127.0.0.1:8000/v1"
+      vllm_model: "nvidia/Qwen3.6-27B-NVFP4"
+      vllm_api_key: "local"
+      vllm_model_context: 262144
+      max_tokens: 32768
+      batch_size: 2
+    embedding:
+      model_name: "ViT-B-32"
+      device: "cuda"
+    ocr:
+      backend: "vllm"
+      base_url: "http://127.0.0.1:8000/v1"
+      model: "nvidia/Qwen3.6-27B-NVFP4"
+      concurrency: 2
+    reconstruction:
+      backend: "vllm"
+      base_url: "http://127.0.0.1:8000/v1"
+      model: "nvidia/Qwen3.6-27B-NVFP4"
+
+  apple_fast:
+    description: "Small native Apple ingestion using the model configured in MLX_MODEL/OMLX_MODEL"
+    frame_extraction:
+      strategy: "fixed_fps"
+      fps: 0.2
+      max_dimension: 640
+    captioning:
+      backend: "omlx"
+      omlx_base_url: "http://127.0.0.1:8000/v1"
+      omlx_model: null
+      max_tokens: 32768
+      batch_size: 4
     embedding:
       model_name: "ViT-B-32"
       device: "mps"
+    ocr:
+      backend: "omlx"
+      base_url: "http://127.0.0.1:8000/v1"
+      concurrency: 4
+    reconstruction:
+      backend: "omlx"
+      base_url: "http://127.0.0.1:8000/v1"
 
-  standard:
-    description: "Standard quality — 1 fps"
-    frame_extraction:
-      fps: 1.0
-      max_dimension: 1280
-    captioning:
-      model: "llama3.2-vision"
-      max_tokens: 512
-    embedding:
-      model_name: "ViT-B-32"
-      device: "mps"
-
-  high_quality:
-    description: "Maximum detail — 2 fps, larger CLIP model"
-    frame_extraction:
-      fps: 2.0
-      max_dimension: 1920
-    captioning:
-      model: "llama3.2-vision"
-      max_tokens: 1024
-    embedding:
-      model_name: "ViT-L-14"
-      pretrained: "laion2b_s32b_b82k"
-      device: "mps"
-
-# ─── Test Cases ────────────────────────────────────────────────────────
 test_cases:
-  # ── Ingestion Tests ──
-  - id: "TC-001"
-    name: "Basic video ingestion"
-    category: "ingestion"
-    command: |
-      python -m src.cli ingest "{video_file}" --fps 0.2 --device mps
+  - id: "TC-UNIT-001"
+    name: "Offline Python suite"
+    category: "unit"
+    platforms: ["dgx_spark", "apple_silicon"]
+    command: "pytest tests/ -v"
+    expected:
+      exit_code: 0
+
+  - id: "TC-DGX-001"
+    name: "DGX host and service preflight"
+    category: "deployment"
+    platforms: ["dgx_spark"]
+    command: "./setup_and_run_dgx.sh doctor"
     expected:
       exit_code: 0
       output_contains:
-        - "Extracting frames"
-        - "Captioning frames"
+        - "Linux detected"
+        - "ARM64 host detected"
+        - "NVIDIA GB10 GPU detected"
+        - "doctor passed"
+
+  - id: "TC-DGX-002"
+    name: "Pinned CUDA and OpenCLIP environment"
+    category: "deployment"
+    platforms: ["dgx_spark"]
+    command: "./setup_and_run_dgx.sh setup"
+    expected:
+      exit_code: 0
+      output_contains:
+        - "CUDA/OpenCLIP preflight passed"
+        - "torch 2.11.0+cu130"
+        - "torchvision 0.26.0+cu130"
+        - "setup complete"
+
+  - id: "TC-DGX-003"
+    name: "Exact-model discovery"
+    category: "inference"
+    platforms: ["dgx_spark"]
+    command: "./setup_and_run_dgx.sh run models"
+    expected:
+      exit_code: 0
+      output_contains:
+        - "nvidia/Qwen3.6-27B-NVFP4"
+        - "yes (vision)"
+
+  - id: "TC-DGX-004"
+    name: "Application-level multimodal smoke"
+    category: "inference"
+    platforms: ["dgx_spark"]
+    description: "Uses ScreenLens InferenceClient, not curl, to read the tracked screenshot."
+    command: "./setup_and_run_dgx.sh smoke"
+    expected:
+      exit_code: 0
+      output_contains:
+        - "ScreenLens vision smoke passed"
+        - "read test.mov"
+
+  - id: "TC-DGX-010"
+    name: "Timestamped DGX ingestion"
+    category: "ingestion"
+    platforms: ["dgx_spark"]
+    command: >-
+      ./setup_and_run_dgx.sh run ingest "{video_file}"
+      --strategy fixed_fps --fps 0.2 --batch-size 2 --device cuda
+    timeout_seconds: 900
+    expected:
+      exit_code: 0
+      output_contains:
+        - "ScreenLens — Video Ingestion"
+        - "Captioning with vllm"
         - "Ingestion complete"
-      data_created:
-        - "data/frames/frame_000000.jpg"
-        - "data/captions/all_captions.json"
+      output_directory_pattern: "data/test_????????_??????"
+      data_created_relative_to_output:
+        - "frames/"
+        - "captions/all_captions.json"
+        - "chromadb/"
 
-  - id: "TC-002"
-    name: "Frame count validation"
+  - id: "TC-DGX-011"
+    name: "Latest timestamped ingestion has usable captions"
     category: "ingestion"
-    description: "Verify correct number of frames extracted for video duration"
-    command: |
-      python -c "
-      import json
-      with open('data/captions/all_captions.json') as f:
-          frames = json.load(f)
-      print(f'Frames: {len(frames)}')
-      assert len(frames) > 0, 'No frames extracted'
-      # At 0.2 fps, a 30-min video should produce ~360 frames
-      print('PASS')
-      "
+    platforms: ["dgx_spark"]
+    command: >-
+      .venv-dgx/bin/python -c
+      "import json; from pathlib import Path;
+      roots=sorted(p for p in Path('data').glob('test_????????_??????') if p.is_dir());
+      assert roots, 'no timestamped test output';
+      rows=json.loads((roots[-1]/'captions'/'all_captions.json').read_text());
+      assert rows and all(len(str(r.get('caption','')).strip()) > 20 for r in rows[:5]);
+      assert all('[Error' not in str(r.get('caption','')) for r in rows[:5]);
+      print('CAPTIONS_OK', roots[-1], len(rows))"
     expected:
       exit_code: 0
-      output_contains: ["PASS"]
+      output_contains: ["CAPTIONS_OK"]
 
-  - id: "TC-003"
-    name: "Caption quality check"
-    category: "ingestion"
-    description: "Verify captions contain meaningful descriptions"
-    command: |
-      python -c "
-      import json
-      with open('data/captions/all_captions.json') as f:
-          frames = json.load(f)
-      for f in frames[:5]:
-          caption = f.get('caption', '')
-          assert len(caption) > 20, f'Caption too short: {caption}'
-          assert '[Error' not in caption, f'Caption error: {caption}'
-      print(f'Checked {min(5, len(frames))} captions — all valid')
-      print('PASS')
-      "
-    expected:
-      exit_code: 0
-      output_contains: ["PASS"]
-
-  # ── Search Tests ──
-  - id: "TC-010"
-    name: "Basic semantic search"
+  - id: "TC-DGX-020"
+    name: "Semantic search and local summary"
     category: "search"
-    command: |
-      python -m src.cli search "What application is shown?" --top-k 5
+    platforms: ["dgx_spark"]
+    command: >-
+      ./setup_and_run_dgx.sh run search
+      "What application, terminal command, or workflow is shown?"
+      --data-dir ./data --top-k 5 --device cuda
     expected:
       exit_code: 0
       output_contains:
         - "Score"
         - "Caption"
+        - "Summary"
 
-  - id: "TC-011"
-    name: "UI element search"
-    category: "search"
-    command: |
-      python -m src.cli search "buttons and menus on screen" --top-k 5
-    expected:
-      exit_code: 0
-      output_contains: ["Score"]
-
-  - id: "TC-012"
-    name: "Text content search"
-    category: "search"
-    command: |
-      python -m src.cli search "any text or labels visible on screen" --top-k 3
-    expected:
-      exit_code: 0
-      output_contains: ["Score"]
-
-  - id: "TC-013"
-    name: "Action search"
-    category: "search"
-    command: |
-      python -m src.cli search "user clicking or interacting with something" --top-k 5
-    expected:
-      exit_code: 0
-      output_contains: ["Score"]
-
-  # ── Summarization Tests ──
-  - id: "TC-020"
-    name: "Video summary generation"
-    category: "summarization"
-    command: |
-      python -m src.cli search "Summarize what happens in this video" --top-k 10
-    expected:
-      exit_code: 0
-      output_contains: ["Summary"]
-
-  - id: "TC-021"
-    name: "Step-by-step workflow extraction"
-    category: "summarization"
-    command: |
-      python -m src.cli search "What are the steps shown in this demonstration?" --top-k 15
-    expected:
-      exit_code: 0
-      output_contains: ["Summary"]
-
-  # ── Edge Cases ──
-  - id: "TC-030"
-    name: "Empty query handling"
-    category: "edge_case"
-    command: |
-      python -m src.cli search ""
-    expected:
-      exit_code: 0
-
-  - id: "TC-031"
-    name: "Vector store info"
-    category: "edge_case"
-    command: |
-      python -m src.cli info
+  - id: "TC-DGX-030"
+    name: "Verbatim transcription through vLLM"
+    category: "transcription"
+    platforms: ["dgx_spark"]
+    command: >-
+      ./setup_and_run_dgx.sh run transcribe "{video_file}"
+      --backend vllm
+      --inference-model nvidia/Qwen3.6-27B-NVFP4
+      --sample-fps 0.5
+    timeout_seconds: 900
     expected:
       exit_code: 0
       output_contains:
-        - "Frames stored"
-        - "Collection"
+        - "ScreenLens — Verbatim Transcription"
+        - "OCR (vision): nvidia/Qwen3.6-27B-NVFP4"
+        - "Done in"
+      data_created_relative_to_output:
+        - "ocr/all_ocr.json"
+        - "output/transcript.raw.md"
+        - "output/transcript.md"
+        - "output/transcribe_meta.json"
 
-# ─── Computer-Use Agent Script ─────────────────────────────────────────
-# This section defines steps for an automated agent (e.g., Claude computer-use)
-# to execute the full test suite end-to-end.
+  - id: "TC-APPLE-001"
+    name: "Native Apple ingestion"
+    category: "ingestion"
+    platforms: ["apple_silicon"]
+    preconditions:
+      - "oMLX serves a vision-capable model at http://127.0.0.1:8000/v1"
+      - "MLX_MODEL or OMLX_MODEL names that served model"
+    command: >-
+      python -m src.cli ingest "{video_file}"
+      --backend omlx --inference-url http://127.0.0.1:8000/v1
+      --strategy fixed_fps --fps 0.2 --batch-size 4 --device mps
+    expected:
+      exit_code: 0
+      output_contains:
+        - "Captioning with omlx"
+        - "CLIP device: mps"
+        - "Ingestion complete"
+      output_directory_pattern: "data/test_????????_??????"
+
+  - id: "TC-COMPAT-001"
+    name: "Legacy oMLX flag aliases remain accepted"
+    category: "compatibility"
+    platforms: ["apple_silicon"]
+    command: >-
+      python -m src.cli models --backend omlx
+      --omlx-url http://127.0.0.1:8000/v1
+    expected:
+      exit_code: 0
+      output_contains: ["omlx models"]
 
 agent_script:
-  name: "ScreenLens End-to-End Test Agent"
-  description: "Automated test script for computer-use agent"
-
+  name: "ScreenLens DGX Spark End-to-End Validation"
+  description: "Deterministic deployment checks followed by a small real pipeline run"
+  platform: "dgx_spark"
   pre_conditions:
-    - "Ollama is running with llama3.2-vision and llama3.2 models loaded"
-    - "Python 3.11+ is installed with all dependencies"
-    - "The test video file exists in the project directory"
-
+    - "Run from the ScreenLens repository root on DGX Spark."
+    - "input-videos/test.mov exists and is a short recording with visible text."
+    - "Docker and NVIDIA Container Toolkit are configured."
+    - "HF_TOKEN is available if no exact-model vLLM service is already ready."
   steps:
     - step: 1
-      action: "Open terminal"
-      command: "cd screenlens"
-      verify: "Terminal shows correct directory"
-
+      action: "Validate the host and reuse/start conditions"
+      command: "./setup_and_run_dgx.sh doctor"
+      verify: "doctor passed"
     - step: 2
-      action: "Verify Ollama is running"
-      command: "curl -s http://127.0.0.1:11434/api/tags | python -m json.tool"
-      verify: "Output shows available models including llama3.2-vision"
-
+      action: "Create or repair the checked CUDA environment"
+      command: "./setup_and_run_dgx.sh setup"
+      verify: "CUDA/OpenCLIP preflight passed"
     - step: 3
-      action: "Run fast ingestion"
-      command: "python -m src.cli ingest 'Screen Recording 2026-04-04 at 8.33.55 AM.mov' --fps 0.2 --device mps"
-      verify: "Output shows 'Ingestion complete' with frame count and timing"
-      timeout: 600
-
+      action: "Start or reuse the exact NVIDIA Qwen service"
+      command: "./setup_and_run_dgx.sh llm-up"
+      verify: "the exact-model endpoint is ready"
     - step: 4
-      action: "Verify data created"
-      command: "ls -la data/frames/ | head -20 && cat data/captions/all_captions.json | python -c 'import json,sys; d=json.load(sys.stdin); print(f\"{len(d)} captions\")'"
-      verify: "Frame files exist and caption count matches"
-
+      action: "Prove the model processes images through ScreenLens"
+      command: "./setup_and_run_dgx.sh smoke"
+      verify: "ScreenLens vision smoke passed and read test.mov"
     - step: 5
-      action: "Run search test"
-      command: "python -m src.cli search 'What application is being demonstrated?' --top-k 5"
-      verify: "Results table displayed with scores and captions"
-
+      action: "Run a bounded real ingestion"
+      command: >-
+        ./setup_and_run_dgx.sh run ingest input-videos/test.mov
+        --strategy fixed_fps --fps 0.2 --batch-size 2 --device cuda
+      verify: "a new data/test_YYYYMMDD_HHMMSS directory contains captions and ChromaDB data"
     - step: 6
-      action: "Run summary test"
-      command: "python -m src.cli search 'Summarize the entire video' --top-k 10"
-      verify: "Summary panel displayed with coherent description"
-
-    - step: 7
-      action: "Check vector store"
-      command: "python -m src.cli info"
-      verify: "Shows collection name, frame count, and time range"
-
+      action: "Search and summarize through the same local backend"
+      command: >-
+        ./setup_and_run_dgx.sh run search "What is shown?"
+        --data-dir ./data --top-k 5 --device cuda
+      verify: "the command displays ranked captions and a Summary panel"
   post_conditions:
-    - "data/frames/ contains extracted frame images"
-    - "data/captions/all_captions.json contains frame metadata with captions"
-    - "data/chromadb/ contains persistent vector store"
-    - "Search queries return relevant results with similarity scores"
+    - "A timestamped data/test_* folder contains frames, captions, and a ChromaDB collection."
+    - "No generated video, frame, model, cache, database, or .env file is staged in Git."
+    - "An externally owned DigitalTwin vLLM service remains running and unmanaged by ScreenLens."

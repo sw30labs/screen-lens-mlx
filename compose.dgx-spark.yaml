@@ -1,0 +1,63 @@
+name: screen-lens-dgx-spark
+
+services:
+  llm:
+    image: ${VLLM_IMAGE:-vllm/vllm-openai@sha256:e4f88a835143cd22aee2397a26ec6bb80b3a4a6fe0c882bcbc63822904766089}
+    platform: linux/arm64
+    # Start vLLM only through setup_and_run_dgx.sh; do not auto-start on reboot.
+    restart: "no"
+    init: true
+    ipc: host
+    gpus: all
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      HF_HOME: /root/.cache/huggingface
+      HF_TOKEN: ${HF_TOKEN:?Set HF_TOKEN in the environment or private .env file}
+      # Standard Hub HTTP is resumable and avoids intermittent authenticated
+      # Xet CAS failures observed on DGX Spark.
+      HF_HUB_DISABLE_XET: ${HF_HUB_DISABLE_XET:-1}
+    volumes:
+      - type: bind
+        source: ${DGX_HF_CACHE:-./.local-models/huggingface}
+        target: /root/.cache/huggingface
+      - type: bind
+        source: ${DGX_VLLM_CACHE:-./.local-models/vllm}
+        target: /root/.cache/vllm
+    command:
+      - ${VLLM_MODEL:-nvidia/Qwen3.6-27B-NVFP4}
+      - --revision
+      - ${VLLM_MODEL_REVISION:-0893e1606ff3d5f97a441f405d5fc541a6bdf404}
+      - --host
+      - "0.0.0.0"
+      - --port
+      - "8000"
+      - --tensor-parallel-size
+      - "1"
+      - --trust-remote-code
+      - --kv-cache-dtype
+      - "${VLLM_KV_CACHE_DTYPE:-fp8}"
+      - --attention-backend
+      - flashinfer
+      - --quantization
+      - "${VLLM_QUANTIZATION:-modelopt}"
+      - --gpu-memory-utilization
+      - "${VLLM_GPU_MEMORY_UTILIZATION:-0.45}"
+      - --max-model-len
+      - "${VLLM_MAX_MODEL_LEN:-262144}"
+      - --max-num-seqs
+      - "2"
+      - --max-num-batched-tokens
+      - "8192"
+      - --enable-chunked-prefill
+      - --async-scheduling
+      - --enable-prefix-caching
+      - --speculative-config
+      - '{"method":"mtp","num_speculative_tokens":2}'
+      - --load-format
+      - fastsafetensors
+      - --reasoning-parser
+      - qwen3
+      - --tool-call-parser
+      - qwen3_xml
+      - --enable-auto-tool-choice

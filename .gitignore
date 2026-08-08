@@ -11,6 +11,7 @@ build/
 
 # Virtual environments
 .venv/
+.venv-dgx/
 venv/
 env/
 
@@ -42,6 +43,7 @@ input/
 
 # Model caches
 .cache/
+.local-models/
 *.ckpt
 *.safetensors
 *.bin

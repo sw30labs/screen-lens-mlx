@@ -6,6 +6,14 @@ readonly REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 readonly ENV_NAME="${SCREENLENS_CONDA_ENV:-screenlens}"
 readonly PYTHON_VERSION="3.11"
 
+if [[ "$(uname -s)" == "Linux" \
+    && ( "$(uname -m)" == "aarch64" || "$(uname -m)" == "arm64" ) ]]; then
+    printf '%s\n' \
+        '[ScreenLens] DGX Spark detected. Use ./setup_and_run_dgx.sh setup, then' \
+        '[ScreenLens] ./setup_and_run_dgx.sh run [COMMAND ...] so CUDA 13 wheels are pinned.' >&2
+    exit 2
+fi
+
 log() {
     printf '[ScreenLens] %s\n' "$*"
 }
@@ -79,7 +87,7 @@ fi
 
 if [[ ! -f .env && -f .env.example ]]; then
     cp .env.example .env
-    log "Created .env from .env.example; review its oMLX model and API settings."
+    log "Created .env from .env.example; review its Apple Silicon/oMLX settings."
 fi
 
 log "Installing ScreenLens and TUI support in editable mode"

@@ -1,8 +1,9 @@
 """
 Verbatim OCR pass.
 
-Transcribes each frame character-for-character with a VISION model via the oMLX
-OpenAI-compatible server. Unlike captioning, this never describes — it copies.
+Transcribes each frame character-for-character with a VISION model through a
+vLLM or oMLX OpenAI-compatible server. Unlike captioning, this never describes
+— it copies.
 
 Defenses baked in after the original failure (a text-only model was used for
 vision and silently returned "no image provided" for all 173 frames):
@@ -16,16 +17,19 @@ vision and silently returned "no image provided" for all 173 frames):
 from __future__ import annotations
 
 import logging
+import platform
 import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from .config import OCRConfig
 from .omlx_client import (
-    OMLXClient,
-    normalize_omlx_base_url,
+    InferenceClient,
     resolve_ocr_model,
-    _env_value,
+    resolve_role_api_key,
+    resolve_role_backend,
+    resolve_role_base_url,
+    resolve_role_context,
 )
 
 logger = logging.getLogger("screenlens.ocr")
@@ -42,20 +46,23 @@ _EMPTY_MARKERS = {"[no text]", "[notext]", "no text", ""}
 
 
 class VerbatimOCR:
-    """Transcribe frames verbatim through an oMLX vision model."""
+    """Transcribe frames verbatim through the selected vision server."""
 
     def __init__(self, config: OCRConfig):
         self.config = config
+        if config.deterministic_backstop and platform.system() != "Darwin":
+            raise RuntimeError(
+                "The deterministic OCR backstop uses Apple Vision and is only "
+                "available on macOS; omit --deterministic on DGX Spark."
+            )
         self.model = resolve_ocr_model(config)
-        base_url = normalize_omlx_base_url(config.base_url)
-        api_key = config.api_key or _env_value(
-            "OCR_API_KEY", "MLX_API_KEY", "OMLX_API_KEY", ignore_placeholders=True
-        )
-        self.client = OMLXClient.from_endpoint(
-            base_url=base_url,
+        self.client = InferenceClient.from_endpoint(
+            base_url=resolve_role_base_url(config),
             model=self.model,
-            api_key=api_key,
+            api_key=resolve_role_api_key(config, "VLLM_OCR_API_KEY", "OCR_API_KEY"),
+            backend=resolve_role_backend(config),
             timeout=config.timeout_seconds,
+            context_size=resolve_role_context(config),
             default_max_tokens=config.max_tokens,
             default_temperature=config.temperature,
         )
@@ -78,9 +85,9 @@ class VerbatimOCR:
             raise RuntimeError(
                 f"OCR model '{self.model}' looks text-only. Verbatim OCR sends "
                 f"images, so it would read every frame blind (this is exactly the "
-                f"bug that produced 173 empty captions). Set OCR_MODEL / "
-                f"ocr.model to a vision model (VL / vision / omni / *-OCR), e.g. "
-                f"mlx-community/olmOCR-2-7B-1025-8bit. To override, set "
+                f"bug that produced 173 empty captions). Set ocr.model or the "
+                f"selected provider's OCR/model environment variable to a vision "
+                f"model (VL / vision / omni / *-OCR). To override, set "
                 f"ocr.require_vision_model=false."
             )
         if supports is None:
@@ -110,7 +117,8 @@ class VerbatimOCR:
             raise RuntimeError(
                 f"OCR model '{self.model}' responded as if no image was sent "
                 f"(\"{(raw or '').strip()[:80]}…\"). It is not actually seeing "
-                f"frames. Pick a vision-capable model on your oMLX server."
+                f"frames. Pick a vision-capable model on your "
+                f"{self.client.backend.value} server."
             )
 
     # ── Per-frame OCR ────────────────────────────────────────────────────────

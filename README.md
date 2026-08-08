@@ -1,316 +1,394 @@
 # ScreenLens
 
 [![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://python.org)
+[![DGX Spark](https://img.shields.io/badge/NVIDIA_DGX_Spark-CUDA-76B900?logo=nvidia&logoColor=white)](docs/DGX_SPARK.md)
 [![Apple Silicon](https://img.shields.io/badge/Apple_Silicon-MPS-000000?logo=apple&logoColor=white)](https://developer.apple.com/metal/)
 [![LangGraph](https://img.shields.io/badge/LangGraph-Pipeline-1C3C3C?logo=langchain&logoColor=white)](https://github.com/langchain-ai/langgraph)
 [![Version](https://img.shields.io/badge/version-0.2.0-blue)]()
 [![Author](https://img.shields.io/badge/Author-Nicolas_Cravino-orange)](https://github.com/ai-agents-cybersecurity)
-[![Assisted by Claude](https://img.shields.io/badge/Assisted_by-Claude-blueviolet?logo=anthropic&logoColor=white)](https://anthropic.com)
 [![License](https://img.shields.io/badge/License-Apache_2.0-green.svg)](LICENSE)
 
-Local video scene intelligence for Apple Silicon. Processes screen recordings through a LangGraph-orchestrated pipeline: smart keyframe extraction, Qwen3.5-VL captioning via oMLX, CLIP embedding, vector search, and LLM-powered summarization — all running on your machine with no cloud dependencies. Inspired by NVIDIA VSS, rebuilt from scratch for Apple Silicon.
+Local video scene intelligence for NVIDIA DGX Spark and Apple Silicon. ScreenLens extracts meaningful frames from screen recordings, captions or transcribes them with a local multimodal model, embeds them with OpenCLIP, indexes them in ChromaDB, and reconstructs visible code, documents, PDFs, and GUI walkthroughs. Linux/ARM64 uses vLLM + CUDA by default; Apple Silicon uses oMLX + MPS. Ollama remains an optional fallback.
 
 ## Demo
 
-![Ingestion pipeline running on Apple Silicon](assets/ingest-demo.png)
+![ScreenLens ingestion pipeline](assets/ingest-demo.png)
 
 ## Architecture
 
 ```mermaid
 graph TD
-    A[Video Input<br/>.mov / .mp4] --> B[Hybrid Keyframe Detection<br/>SSIM + pHash + HSV histogram]
-    B --> C[Vision Captioning<br/>Qwen3.5-VL via oMLX]
-    C --> D[Caption Archive<br/>frames + timestamps + descriptions]
-    D --> E[Content Classification<br/>code / docs / PDF / GUI demo]
-    E --> F[Reconstruction Plan<br/>files, sections, tasks]
-    F --> G[Hierarchical Reconstruction<br/>oMLX agents]
-    G --> H[QA Reflection<br/>retry when incomplete]
-    H --> I[Reconstructed Artifacts<br/>data/*/output]
-
-    style A fill:#4a90d9,color:#fff
-    style B fill:#8e44ad,color:#fff
-    style C fill:#e74c3c,color:#fff
-    style E fill:#2ecc71,color:#fff
-    style G fill:#e67e22,color:#fff
-    style I fill:#27ae60,color:#fff
+    A[Video Input<br/>.mov / .mp4] --> B[Hybrid Keyframe Detection<br/>SSIM + pHash + HSV]
+    B --> C{Local vision backend}
+    C -->|DGX Spark| D[vLLM<br/>NVIDIA Qwen3.6 NVFP4]
+    C -->|Apple Silicon| E[oMLX<br/>configured multimodal model]
+    C -->|optional| F[Ollama vision]
+    D --> G[Captions / Verbatim OCR]
+    E --> G
+    F --> G
+    G --> H[OpenCLIP Embeddings<br/>CUDA / MPS / CPU]
+    H --> I[ChromaDB Search]
+    G --> J[LangGraph Reconstruction<br/>plan → workers → QA]
+    J --> K[Reconstructed Artifacts<br/>data/*/output]
 ```
 
-## Pipeline Flow (LangGraph)
-
-```mermaid
-stateDiagram-v2
-    [*] --> Ingest: video_path
-    Ingest --> Caption: keyframes extracted
-    Caption --> Embed: captions generated
-    Embed --> Classify: ingested folder
-    Classify --> Plan: content type
-    Plan --> Reconstruct: reconstruction tasks
-    Reconstruct --> QA: draft artifacts
-    QA --> Save: accepted or retried
-    Save --> [*]: output files
-```
+The vLLM and oMLX paths share the same small OpenAI-compatible client, including image data URLs and `chat_template_kwargs.enable_thinking=false` for Qwen-style models. Platform detection changes defaults, not the pipeline itself.
 
 ## Component Overview
 
 | Component | Technology | Purpose |
-|-----------|-----------|---------|
-| Frame Extraction | **Hybrid keyframe detection** (SSIM + pHash + HSV) | Only captures distinct screens — skips duplicates |
-| Vision Captioning | **Qwen3.5-VL** via oMLX (Apple Silicon native) | Dense, high-fidelity frame descriptions through oMLX's OpenAI-compatible VLM API |
-| Fallback Captioning | Ollama (llama3.2-vision) | Cross-platform alternative |
-| Visual Embeddings | OpenCLIP ViT-B-32 | Semantic vector representations |
-| Vector Storage | ChromaDB | Optional inspection index for ingested frames |
-| Reconstruction | LangGraph + oMLX | Classify recordings and rebuild source/docs/demo references |
-| Orchestration | LangGraph StateGraph | Pipeline state management |
-| CLI | Typer + Rich | User interface |
+|---|---|---|
+| Frame extraction | Hybrid SSIM + pHash + HSV detection | Capture distinct screens while bounding long static intervals |
+| DGX vision/text | `nvidia/Qwen3.6-27B-NVFP4` via vLLM | Caption frames, perform OCR, summarize, and reconstruct through one dense local model |
+| Apple vision/text | Configured multimodal model via oMLX | Native Apple Silicon OpenAI-compatible inference |
+| Optional fallback | Ollama | Alternative captioning and summarization when explicitly selected |
+| Visual embeddings | OpenCLIP ViT-B-32 | Semantic image/text vectors on CUDA, MPS, or CPU |
+| Vector storage | ChromaDB | Persistent per-video semantic search |
+| Reconstruction | LangGraph | Classify recordings and rebuild code/docs/demo artifacts with QA retries |
+| Interfaces | Typer + Rich, optional Textual | CLI and terminal GUI |
 
-## Prerequisites
+## Platform Defaults
 
-- **Hardware**: Apple Silicon Mac (M1+). Optimized for M3 Ultra with 512GB unified memory.
-- **Python 3.11+**
-- **ffmpeg**: `brew install ffmpeg`
-- **oMLX**: Start the local OpenAI-compatible server on `http://127.0.0.1:8000/v1`.
-- **oMLX API key**: Set `MLX_API_KEY` or `OMLX_API_KEY` if authentication is enabled. ScreenLens loads `.env` automatically, and shell exports take precedence.
-- **Ollama** (for summarization): Install from [ollama.com](https://ollama.com) and pull:
+| Host | Inference | Embeddings | Concurrent image requests |
+|---|---|---|---:|
+| Linux ARM64 / DGX Spark | vLLM | CUDA | 2 |
+| Darwin ARM64 / Apple Silicon | oMLX | MPS | 4 |
+| Other hosts | oMLX unless overridden | CPU | 4 |
 
-```bash
-ollama pull llama3.2           # Text model for summarization
-ollama pull llama3.2-vision    # Only needed if using --backend ollama for captioning
-```
-
-oMLX can reuse existing MLX-format model directories and exposes models through `/v1/models`. `MLX_MODEL`, `OMLX_MODEL`, or `--omlx-model` can select the served model; otherwise ScreenLens uses `default`. Captioning requires a vision-capable model; text-only models such as DeepSeek V3/V4/R1 and GPT-OSS cannot process frames.
+Caption output is capped at 32,768 tokens by default. The bundled dense Spark service exposes a 262,144-token total context, leaving ample prompt and image-token headroom while reconstruction can use the full served window.
 
 ## Installation
 
-For an idempotent Conda setup and launcher, run:
+### NVIDIA DGX Spark
+
+The checked helper creates an isolated Python 3.12 CUDA environment, validates the host and OpenCLIP, starts or reuses the exact vLLM model, and performs a real vision smoke test:
 
 ```bash
-./setup_and_run.sh
+(umask 077; touch .env)
+chmod 600 .env
+${EDITOR:-nano} .env  # add HF_TOKEN=hf_... if ScreenLens must start vLLM
+
+./setup_and_run_dgx.sh doctor
+./setup_and_run_dgx.sh setup
+./setup_and_run_dgx.sh llm-up
+./setup_and_run_dgx.sh llm-wait
+./setup_and_run_dgx.sh smoke
+./setup_and_run_dgx.sh run
 ```
 
-The script creates a `screenlens` environment with Python 3.11 and ffmpeg when
-needed, installs ScreenLens in editable mode with TUI support, creates `.env`
-from `.env.example` without overwriting an existing file, and launches the TUI.
-Pass a CLI command to run it instead:
+`run` launches the TUI with no arguments or passes a CLI command through:
 
 ```bash
-./setup_and_run.sh info
-./setup_and_run.sh ingest "video.mov"
+./setup_and_run_dgx.sh run ingest input-videos/demo.mov
+./setup_and_run_dgx.sh run transcribe input-videos/demo.mov
 ```
 
-Set `SCREENLENS_CONDA_ENV` to use a different Conda environment name.
+DigitalTwin uses the same model and loopback port. The helper reuses an already-ready exact-model service instead of starting a conflicting container. See [the complete DGX Spark guide](docs/DGX_SPARK.md) for CUDA wheel pins, cache sharing, memory sizing, service ownership, and troubleshooting.
 
-For a manual installation:
+### Apple Silicon / Conda
+
+Start oMLX on `http://127.0.0.1:8000/v1`, configure `MLX_*` or `OMLX_*` values in `.env`, then use the existing Conda launcher:
 
 ```bash
-cd screenlens
-pip install -e .
+./setup_and_run_macos.sh
+./setup_and_run_macos.sh ingest "video.mov"
 ```
 
-The terminal GUI is optional:
+The script creates a `screenlens` Conda environment with Python 3.11 and ffmpeg, installs the TUI extra, preserves an existing `.env`, and defaults to the TUI. Set `SCREENLENS_CONDA_ENV` to choose another environment name. On Linux/ARM64 it exits with directions to the checked Spark helper so a generic pip install cannot replace CUDA 13 wheels with CPU wheels.
+
+### Manual development install
 
 ```bash
-pip install -e ".[tui]"
+pip install -e ".[dev,tui]"
+pytest tests/ -v
 ```
+
+Install ffmpeg separately and ensure the selected inference server is running. Ollama is not required for the normal vLLM or oMLX paths.
 
 ## Usage
 
-### 1. Ingest a Video (recommended — oMLX + keyframes)
+### Provider Selection
+
+Commands that contact the direct inference service accept provider-neutral flags:
 
 ```bash
-cp .env.example .env
-# Edit .env with your oMLX key and model, or export these variables in your shell.
-python -m src.cli ingest "Screen Recording 2026-04-04 at 8.33.55 AM.mov"
+python -m src.cli ingest video.mov \
+  --backend vllm \
+  --inference-url http://127.0.0.1:8000/v1 \
+  --inference-model nvidia/Qwen3.6-27B-NVFP4 \
+  --inference-api-key local \
+  --device cuda \
+  --batch-size 2
 ```
 
-This uses smart keyframe detection (only captures when the screen actually changes) and the configured oMLX VLM for high-fidelity captions. Dashboard URLs such as `http://127.0.0.1:8000/admin/dashboard` are normalized to `http://127.0.0.1:8000/v1`.
+`--vllm-url`, `--vllm-model`, and `--vllm-api-key` are provider-specific aliases; the existing `--omlx-*` spellings remain compatible. `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, and `SCREENLENS_BATCH_SIZE` override platform defaults. Provider credentials and models can also come from `VLLM_*`, `MLX_*`, or `OMLX_*` variables as appropriate.
 
-### 2. Ingest with Ollama (alternative)
+### Model Roles
+
+ScreenLens drives two roles against one OpenAI-compatible endpoint:
+
+| Role | Used by | Requirement | oMLX default |
+|---|---|---|---|
+| **vision** | captioning, verbatim OCR | must be vision-capable — a text-only model answers "no image provided" for every frame | `Qwen3.6-27B-bf16` (`OCR_MODEL` / `MLX_MODEL`) |
+| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; must stay coherent on markdown with indented lists, which is what captions are | `Qwen3.6-27B-bf16` (`LLM_MODEL`) |
+
+On DGX Spark both resolve to the single served vLLM checkpoint. The defaults do
+the same on Apple Silicon — one resident checkpoint serving both roles — but the
+roles resolve independently, so pointing `LLM_MODEL` at a dedicated text model
+is fully supported.
+
+Test any such model against a real caption first. `DeepSeek-V4-Flash-0731-MLX`
+under oMLX emits its BOS token until the token budget runs out when the prompt
+contains a markdown list item with a leading indent (`\n   - `), which every
+caption has. ScreenLens detects that shape and raises `InferenceDegenerateError`
+rather than saving the output as a summary, so the failure is loud rather than
+silent — but the model still cannot do the work.
+
+Check what your endpoint serves and which side of the vision line each model
+falls on:
 
 ```bash
-python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps 1.0
+python -m src.cli models
 ```
 
-### 3. Use a Specific oMLX Model
+The capability guard aborts a `transcribe` run whose OCR model is text-only,
+and the command deck's vision selector only offers models that can see.
+
+### Ingest and Search
 
 ```bash
-python -m src.cli ingest "video.mov" --omlx-model mlx-community/Qwen3.5-35B-A3B-4bit
+# Uses vLLM/CUDA on DGX Spark or oMLX/MPS on Apple Silicon.
+python -m src.cli ingest "video.mov"
+
+# Optional Ollama captioning fallback.
+python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps 1
+
+# Search one or all timestamped collections and synthesize an answer locally.
+python -m src.cli search "What application is shown?" --data-dir ./data --top-k 5
+
+# Ingest and search in one command.
+python -m src.cli run "video.mov" "Summarize the workflow"
 ```
 
-Captioning submits up to 4 concurrent oMLX requests per chunk by default. To override:
+Search summarization follows the configured platform backend; it does not require Ollama unless Ollama was explicitly selected. Each ingestion creates `data/<stem>_<YYYYMMDD_HHMMSS>/` with independent frames, captions, and ChromaDB data.
+
+### Batch Ingestion and Full-Video Summary
 
 ```bash
-python -m src.cli ingest "video.mov" --batch-size 8
+python -m src.cli batch input-videos/
+python -m src.cli summarize
 ```
 
-### 4. Batch-Ingest a Folder of Videos
+Batch ingestion gives every video its own timestamped directory. Full-video summary reads all stored captions and chooses a single-pass or hierarchical strategy based on the selected backend's configured context window.
 
-```bash
-python -m src.cli batch "/path/to/recordings/"
-```
-
-Each video gets its own data directory under `./data/<video_name>/` with separate frames, captions, embeddings, and ChromaDB collections.
-
-### 5. Reconstruct Artifacts from Recordings
+### Reconstruct and Assemble Artifacts
 
 ```bash
 python -m src.cli reconstruct
+python -m src.cli assemble
 ```
 
-Scans all folders in `./data/`, classifies each recording (Python code, Markdown doc, PDF, or GUI demo), and uses LangGraph deep agents to reconstruct the original artifacts. Features:
+Reconstruction classifies each recording, plans the artifact work, processes it deterministically, and runs up to three QA iterations before saving under `data/<slug>/output/`. Assembly can combine per-recording outputs into one project tree under `OUTPUT/`.
 
-- **Classification** — Auto-detects content type from captions
-- **Parallel sub-agents** — Fan-out via LangGraph `Send` when tasks are independent
-- **Reflection QA** — Up to 3 iterations of quality review before saving
-- **Output** — Reconstructed files saved to `./data/<video_name>/output/`
-
-### 6. Verbatim Transcription (reproduce the exact text/code shown)
+### Verbatim Transcription
 
 ```bash
-# List served oMLX models, labeled vision / text-only / draft
+# Discover served models and their likely vision capability.
 python -m src.cli models
 
-# Transcribe a recording character-for-character
-python -m src.cli transcribe input/policies.mov
+# OCR frames, stitch scrolling overlap, and preserve raw text.
+python -m src.cli transcribe input-videos/policies.mov
 
-# Code recordings: add the Apple Vision deterministic cross-check
-python -m src.cli transcribe input/code.mov --deterministic   # requires: pip install ocrmac
+# Optional seam/indent cleanup; guarded against dropped content.
+python -m src.cli transcribe input-videos/document.mov --cleanup
 
-# Opt in to the LLM seam/indent cleanup pass (off by default)
-python -m src.cli transcribe input/doc.mov --cleanup
+# Apple-only deterministic Vision cross-check for code.
+python -m src.cli transcribe input-videos/code.mov --deterministic
 ```
 
-A separate pipeline from captioning. Instead of *describing* frames it **copies** them: it densely samples frames, OCRs each with a vision model (transcribe, never paraphrase), and stitches them in text space to undo scroll overlap. Designed for faithfully recovering source code, docs, and dense text from a scrolling screen recording.
+The transcribe path copies visible text rather than describing it. A live image probe rejects blind/text-only deployments before a full run. Cleanup is off by default; when enabled, a per-chunk coverage guard keeps the raw stitched chunk whenever the model drops content. Outputs are `transcript.raw.md`, `transcript.md`, `ocr/all_ocr.json`, and metadata under the timestamped data directory.
 
-- **Two models, two jobs** — a **vision** model reads pixels (`OCR_MODEL`, default `Qwen3.6-27B-bf16`); a **text** model optionally tidies seams (`LLM_MODEL`). The OCR model is probed with one real frame before processing, so a text-only choice fails instantly instead of producing empty output.
-- **Thinking disabled for OCR** — a reasoning model would otherwise burn its whole token budget on chain-of-thought and never emit the transcription.
-- **Cleanup is off by default** — the raw stitched OCR is already verbatim. When enabled with `--cleanup`, a per-chunk coverage guard discards any LLM output that drops content and keeps the raw chunk, so `transcript.md` can never lose text vs. `transcript.raw.md`.
-- **Output** — `data/<slug>/output/transcript.md` (+ `transcript.raw.md`, `ocr/all_ocr.json`).
+### Web command deck
 
-### 7. Check Status
+```bash
+python -m src.cli serve                 # http://127.0.0.1:8760, opens a browser
+python -m src.cli serve --port 9000 --no-browser
+python -m src.web                       # same thing without Typer
+```
+
+A local dashboard over every pipeline: run register, frame gallery served
+straight off disk, semantic search, pipeline control, and an artifact reader.
+It is stdlib `http.server` plus one static page — no framework, no build step,
+and no dependency beyond what ScreenLens already installs.
+
+It binds loopback-only and refuses non-loopback clients on every `/api/` route,
+because it starts jobs and reads frames off disk. One job runs at a time: the
+pipelines share a single model endpoint and one CLIP device.
+
+**There is no stop button.** A running job cannot be cancelled from the page:
+interrupting it would mean aborting the in-flight HTTP request to the model
+server, which the stdlib client cannot do mid-read. Jobs run as daemon threads,
+so stopping the deck (Ctrl-C) ends them — the model server may keep generating
+the current request for a while afterwards. This matters more than it sounds:
+`reconstruct` over a large caption set can run for hours (see Performance
+Notes), so check the run size before starting one.
+
+The header shows both model roles at once. If the configured vision model is
+not vision-capable the badge turns red before you waste a run on it, and the
+vision selector only offers models that can actually see.
+
+### Status and TUI
 
 ```bash
 python -m src.cli info
-```
-
-### 8. Launch the Terminal GUI
-
-```bash
 python -m src.cli tui
 ```
 
-The Textual/Rich GUI provides inputs for video paths, data/output directories, and oMLX model selection. Use `Ingest + Reconstruct` for the main workflow: ingest the video, classify what it shows, and reconstruct the matching output from the new ingested folder.
+The TUI detects the native platform default, lists models from the selected OpenAI-compatible endpoint, and supports ingest, reconstruct, and combined workflows.
 
 ## Keyframe Detection
 
 The hybrid change detector uses three complementary signals to decide when the screen has actually changed:
 
 | Signal | What it detects | Threshold |
-|--------|----------------|-----------|
-| **SSIM** (Structural Similarity) | Pixel-level structural changes | < 0.97 |
-| **pHash** (Perceptual Hash) | Perceptual content changes via DCT | hamming >= 8 |
-| **HSV Histogram** | Color distribution shifts | correlation <= 0.90 |
+|---|---|---|
+| SSIM | Pixel-level structural changes | < 0.97 |
+| pHash | Perceptual content changes via DCT | hamming >= 8 |
+| HSV histogram | Color-distribution shifts | correlation <= 0.90 |
 
-A keyframe is emitted when any signal triggers AND enough time has passed (min 0.5s). A forced keyframe is always emitted every 4s (configurable) to catch slow scrolls.
-
-For a typical screen recording, this captures 5-15% of frames vs. fixed FPS, dramatically reducing captioning time while missing nothing.
+A keyframe is emitted when any signal triggers and the minimum 0.5-second interval has elapsed. A forced keyframe every four seconds catches slow scrolling. This typically captures a small fraction of source frames while preserving distinct screens.
 
 ## Configuration
 
-All settings live in `src/config.py` (Pydantic models). Key parameters:
+All settings live in `src/config.py` as Pydantic models. Key parameters:
 
 | Parameter | Default | Description |
-|-----------|---------|-------------|
-| `frame_extraction.strategy` | keyframe | `keyframe` (smart) or `fixed_fps` |
-| `frame_extraction.max_interval_seconds` | 4.0 | Max gap between keyframes |
-| `captioning.backend` | omlx | `omlx` or `ollama` |
-| `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | oMLX OpenAI-compatible API URL; dashboard/root URLs are normalized |
-| `captioning.omlx_model` | null | oMLX model ID; falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL` env vars or `default` |
-| `captioning.batch_size` | 4 | Concurrent oMLX caption requests per chunk |
-| `captioning.max_tokens` | 32768 | Max tokens per caption |
-| `captioning.disable_thinking` | true | Disable reasoning so the caption budget is used for the visible answer |
-| `embedding.model_name` | ViT-B-32 | CLIP model |
-| `embedding.device` | mps | Apple Silicon GPU |
+|---|---|---|
+| `frame_extraction.strategy` | keyframe | Smart change detection or `fixed_fps` |
+| `frame_extraction.max_interval_seconds` | 4.0 | Maximum gap between keyframes |
+| `captioning.backend` | platform-dependent | `vllm`, `omlx`, or optional `ollama` |
+| `captioning.vllm_base_url` | http://127.0.0.1:8000/v1 | DGX Spark OpenAI-compatible API URL |
+| `captioning.vllm_model` | null | Falls back to `VLLM_MODEL`, then the checked NVIDIA Qwen model |
+| `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | Apple oMLX URL; root/dashboard URLs are normalized |
+| `captioning.omlx_model` | null | Falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL`, then `default` |
+| `captioning.batch_size` | 2 DGX / 4 Apple | Concurrent direct-server caption requests |
+| `captioning.max_tokens` | 32768 | Requested caption ceiling; vLLM uses the context remaining after image/prompt tokens |
+| `captioning.retry_attempts` | 1 | Per-frame retries after a direct caption request fails |
+| `captioning.retry_max_tokens` | 2048 | Bounded retry ceiling that prevents malformed generations from consuming another full caption budget |
+| `captioning.repetition_penalty` | 1.05 | Discourage pathological long caption loops |
+| `captioning.no_repeat_ngram_size` | 12 | Block repeated long caption sequences; `0` disables |
+| `captioning.disable_thinking` | true | Spend the output budget on the visible answer |
+| `embedding.model_name` | ViT-B-32 | OpenCLIP architecture |
+| `embedding.device` | CUDA DGX / MPS Apple | Accelerator for OpenCLIP; CPU elsewhere |
+| `ocr.backend` | platform-dependent | Direct `vllm` or `omlx` vision endpoint |
+| `ocr.concurrency` | 2 DGX / 4 Apple | Concurrent verbatim OCR requests |
+| `reconstruction.backend` | platform-dependent | Direct text inference endpoint |
+| `reconstruction.timeout_seconds` | 1800 | Timeout for long-running reconstruction generations |
 
 ## Performance Notes
 
-The default oMLX backend sends each caption as an OpenAI-compatible vision request and lets oMLX handle scheduling, continuous batching, and KV caching server-side. `captioning.batch_size` controls how many frame requests ScreenLens submits concurrently per chunk.
+### Reconstruction cost on Apple Silicon
 
-On Apple Silicon with large vision inputs, **prefill (vision encoder + prompt) dominates per-frame time, not decode**. The main levers for wall-clock improvement are a smaller VLM, a smaller `frame_extraction.max_dimension`, and an oMLX concurrency value that matches the host.
+`reconstruct` gives every extraction pass the whole model context as its output
+ceiling, so vLLM can compute the exact remaining completion space per prompt.
+On Spark that is close to free. On oMLX it is not: a measured 20-caption run
+(98k characters of captions) spent over three hours in Pass 1 alone, because
+each of its three segments generated 20–30k tokens at 6–12 tok/s and two of
+them exhausted the 32K ceiling and split into two passes each.
+
+Before reaching for `reconstruct` on Apple Silicon, check whether `summarize`
+is what you actually want — it chunks to a bounded output and finished the same
+run in four minutes.
+
+Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value. Concurrent results are isolated per frame: one failed request cannot overwrite a successful peer in the same chunk. A failed frame is retried once deterministically with a bounded 2K completion ceiling. A retry that fills that ceiling without terminating is rejected instead of storing a truncated loop; ScreenLens stores an error marker for that frame alone.
+
+DGX Spark has one 128 GB unified-memory pool rather than separate system RAM and VRAM. The checked single-service recipe uses the dense NVFP4 27B model, a `0.45` vLLM allocator target, a 262K context, and concurrency two. Caption requests retain a 32K output ceiling, leaving the rest of the served window for prompt, chat-template, and image tokens. If a service is deliberately reduced to a matching 32K context, ScreenLens omits the literal output limit and lets vLLM allocate the exact context remaining after its input.
+
+Reconstruction groups captions by serialized size rather than frame count, so an unusually long caption cannot overfill a later prompt. Its shared extraction pass requests dense notes under 1,400 tokens but gives the model the full context exposed by the server as completion headroom. Recursive synthesis filters notes to the file or artifact currently being rebuilt and uses that same full ceiling. These long text generations use the independent 1,800-second `reconstruction.timeout_seconds` budget instead of the shorter caption timeout. If a response still ends with `finish_reason=length`, ScreenLens discards the incomplete prefix and retries a smaller input group. The 262K service context is therefore used automatically when `VLLM_MAX_MODEL_LEN` matches it. Native two-token Qwen MTP accelerates decoding without changing answers; DFlash is not loaded because it would add a second draft model and does not increase context or output quality. See [the Spark memory notes](docs/DGX_SPARK.md#memory-and-performance-notes).
+
+`ffprobe` remains optional: when it is absent, video metadata is read through OpenCV without a warning. OpenCLIP's checked checkpoint is public, so ScreenLens suppresses only the Hub's unauthenticated-download advisory; actual authorization, rate-limit, and download failures remain visible. A Hugging Face token is still required when the DGX helper must start the gated vLLM model service.
 
 ## Project Structure
 
-```
+```text
+compose.dgx-spark.yaml # Bounded ARM64/CUDA vLLM service
+docs/
+  DGX_SPARK.md         # Setup, sizing, reuse, lifecycle, troubleshooting
+setup_and_run_dgx.sh   # Checked Spark setup, validation, and launcher
+setup_and_run_macos.sh # Apple Silicon Conda/oMLX launcher
 src/
-  config.py          # Pydantic configuration (extraction, captioning, embedding, search)
-  frame_extractor.py # Hybrid keyframe detection + fixed FPS fallback
-  captioner.py       # Backends: oMLX (default) and Ollama
-  embedder.py        # CLIP embedding via OpenCLIP
-  vector_store.py    # ChromaDB storage + search
-  pipeline.py        # LangGraph StateGraph orchestration (ingest/search/summarize)
-  reconstruct.py     # LangGraph deep agents — artifact reconstruction with QA reflection
-  frame_select.py    # Scroll-safe frame selection for transcribe (dense sample + drop near-dupes)
-  ocr.py             # VerbatimOCR — vision OCR with capability guard, probe, anti-loop controls
-  stitch.py          # Text-space stitcher — undo scroll overlap, strip headers/footers
-  transcribe.py      # Verbatim transcription orchestrator + optional coverage-guarded cleanup
-  omlx_client.py     # oMLX OpenAI-compatible client (shared by all pipelines)
-  cli.py             # Typer CLI interface
-  tui.py             # Optional Textual/Rich terminal GUI
-data/
-  frames/            # Extracted keyframe images
-  captions/          # JSON caption files
-  chromadb/          # Persistent vector database
+  config.py            # Platform-aware Pydantic configuration
+  frame_extractor.py   # Hybrid keyframe detection + fixed-FPS fallback
+  captioner.py         # vLLM, oMLX, and optional Ollama captioning
+  embedder.py          # OpenCLIP embeddings on CUDA/MPS/CPU
+  vector_store.py      # ChromaDB storage and search
+  pipeline.py          # LangGraph ingest/search/summarize graphs
+  reconstruct.py       # Artifact reconstruction with QA reflection
+  frame_select.py      # Scroll-safe dense sampling for transcription
+  ocr.py               # Verbatim vision OCR and capability probe
+  stitch.py            # Text-space scroll-overlap stitching
+  transcribe.py        # Verbatim pipeline and guarded cleanup
+  omlx_client.py       # Shared inference client; legacy module name retained
+  session.py           # Shared config/slug/run-discovery layer for all front ends
+  cli.py               # Typer CLI
+  tui.py               # Optional Textual terminal GUI
+  web/                 # Web command deck (stdlib HTTP, no build step)
+    server.py          # Loopback-only JSON API + static page
+    runner.py          # One-job-at-a-time background runner
+    static/index.html  # Single-file SPA
 tests/
-  test_pipeline.py   # Integration tests
-  test_cases.yaml    # Use-case definitions + computer-use agent script
+  test_pipeline.py     # Core configuration, inference, embedding, and graph tests
+  test_transcribe.py   # Stitching, OCR guards, and cleanup safety
+  test_web.py          # Command deck assets, API contracts, and security
+  test_cases.yaml      # Dual-platform/DGX end-to-end scenarios
 ```
+
+Generated frames, captions, databases, videos, outputs, virtual environments, and model caches are ignored by Git.
 
 ## How It Compares to NVIDIA VSS
 
 | Feature | NVIDIA VSS | ScreenLens |
-|---------|-----------|-----------|
-| Frame extraction | Custom + TensorRT | Hybrid keyframe detection (SSIM/pHash/HSV) |
-| Vision model | NVIDIA VILA | **Qwen3.5-VL** via oMLX |
-| Embeddings | TensorRT Visual Encoder | OpenCLIP ViT-B-32 |
+|---|---|---|
+| Frame extraction | Custom + TensorRT | Hybrid SSIM/pHash/HSV detection |
+| Vision model | NVIDIA VILA | NVIDIA Qwen3.6 via vLLM or a configured oMLX model |
+| Embeddings | TensorRT visual encoder | OpenCLIP ViT-B-32 |
 | Vector DB | Milvus | ChromaDB |
-| LLM | Llama 3.1 70B (NIM) | Ollama (configurable) |
-| Hardware | NVIDIA GPU (DGX) | **Apple Silicon (M-series)** |
-| Deployment | Docker + NIM | pip install |
-| Cloud dependency | None (self-hosted) | None (fully local) |
+| LLM | Llama 3.1 70B / NIM | Same local vLLM/oMLX endpoint used by the pipeline |
+| Hardware | NVIDIA GPU | DGX Spark or Apple Silicon |
+| Deployment | Docker + NIM | Bounded vLLM container + Python, or native oMLX + Python |
+| Cloud dependency | None when self-hosted | None; local model endpoints only |
 
 ## Roadmap
 
 ### Duplicate Detection
+
 - [ ] Harden near-duplicate keyframe filtering (perceptual hash + SSIM fusion threshold tuning)
 - [ ] Cross-video deduplication for multi-file ingestion
-- [ ] Consider leveraging [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) — its autonomous agent architecture is a natural fit for iterating on dedup thresholds and evaluating detection quality at scale
+- [ ] Consider leveraging [Karpathy's autoresearch](https://github.com/karpathy/autoresearch) to iterate on dedup thresholds against a fixed evaluation set
 
 ### Video Profiles
 
-Pre-configured extraction & captioning strategies tailored to content type:
+Preconfigured extraction and captioning strategies tailored to content type:
 
 | Profile | Description | Audio | Typical Source |
-|---------|------------|-------|----------------|
-| **`code`** | Silent screen recording of browsing / editing code | No | IDE walkthroughs, code reviews |
-| **`demo`** | Screencast with voice-over demonstrating software | Yes | Product demos, tutorials, onboarding videos |
-| **`pdf`** | Continuous scroll/browse of a PDF document | No | Recorded PDF read-throughs, slide decks |
-| **`meeting`** | Video call or presentation recording | Yes | Zoom/Teams recordings, webinars |
+|---|---|---|---|
+| `code` | Silent screen recording of browsing/editing code | No | IDE walkthroughs, code reviews |
+| `demo` | Screencast with voice-over demonstrating software | Yes | Product demos, tutorials, onboarding |
+| `pdf` | Continuous scroll/browse of a PDF | No | Recorded read-throughs, slide decks |
+| `meeting` | Video call or presentation | Yes | Zoom/Teams recordings, webinars |
 
-Each profile auto-tunes: frame extraction strategy, captioning prompt, chunking window, and whether the audio pipeline is activated.
+Each profile will tune frame extraction, captioning prompts, chunking, and audio processing.
 
-### Audio Support (Whisper)
-- [ ] Integrate Whisper speech-to-text via **ONNX Runtime** and/or **MLX**
-- [ ] Support model sizes: `small`, `medium`, `large`
-- [ ] Word-level timestamps aligned to keyframe timeline
-- [ ] Fused caption+transcript context for richer semantic search
-- [ ] Profile-aware activation — auto-enabled for `demo` and `meeting`, skipped for `code` and `pdf`
+### Audio Support
 
-### Output Generators (LangGraph Deep Agents)
+- [ ] Integrate Whisper speech-to-text via ONNX Runtime and/or MLX
+- [ ] Support `small`, `medium`, and `large` model sizes
+- [ ] Add word-level timestamps aligned to the keyframe timeline
+- [ ] Fuse captions and transcripts for richer semantic search
 
-Agentic pipelines that consume ingestion results and produce structured deliverables:
+### Output Generators
 
-- [ ] **Manual Generator** (`demo` profile) — Watch a software demo and auto-generate a step-by-step user manual with extracted screenshots, annotated UI elements, and navigation flow
-- [ ] **PDF Summary** (`pdf` profile) — Ingest a screen-recorded PDF browse and produce a structured summary document preserving headings, key points, and referenced figures
-- [ ] **Source Code Reconstruction** (`code` profile) — Scan a code walkthrough video and reconstruct/export the visible source files, function signatures, and project structure
-- [ ] **Meeting Notes** (`meeting` profile) — Transcribe + summarize a recorded meeting with action items, decisions, and speaker attribution
-
-Each generator is implemented as a LangGraph sub-graph with its own state machine, allowing composition, retry, and human-in-the-loop review before final export.
+- [ ] Manual generator with extracted screenshots and navigation flow
+- [ ] PDF summary preserving headings, key points, and figures
+- [ ] Source-code reconstruction with files, signatures, and project structure
+- [ ] Meeting notes with action items, decisions, and speaker attribution

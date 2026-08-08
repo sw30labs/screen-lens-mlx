@@ -3,67 +3,52 @@
 from __future__ import annotations
 
 import io
-import json
 import logging
 import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Iterable
-from urllib import request
-from urllib.error import HTTPError
-
 from .config import CaptionBackend, ScreenLensConfig
+from .session import apply_video_slug, load_config, point_config_at_data_dir
 from .omlx_client import (
     is_known_text_only_model,
-    resolve_omlx_api_key,
-    resolve_omlx_base_url,
-    resolve_omlx_model,
+    list_models,
+    resolve_inference_api_key,
+    resolve_inference_base_url,
+    resolve_inference_model,
 )
 
 
 TUI_INSTALL_HINT = "Install TUI support with: pip install -e '.[tui]'"
-OMLX_AUTH_HINT = "Set MLX_API_KEY or OMLX_API_KEY, then refresh models."
+OMLX_AUTH_HINT = "Set the selected provider's API key, then refresh models."
 
 
 def _yes_no(value: bool) -> str:
     return "yes" if value else "no"
 
 
-def _load_config(config_path: Path | None) -> ScreenLensConfig:
-    """Load a JSON config if it exists, otherwise return defaults."""
-    if config_path and config_path.exists():
-        with open(config_path) as f:
-            return ScreenLensConfig(**json.load(f))
-    return ScreenLensConfig()
-
-
-def _apply_video_slug(config: ScreenLensConfig, video: Path) -> str:
-    """Point config at a per-video timestamped folder under config.data_dir."""
-    base_slug = video.stem.replace(" ", "_")
-    slug = f"{base_slug}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    config.data_dir = config.data_dir / slug
-    config.vector_db.persist_directory = str(config.data_dir / "chromadb")
-    config.vector_db.collection_name = f"screenlens_{base_slug}"
-    return slug
-
-
-def _point_config_at_data_dir(config: ScreenLensConfig, data_dir: Path) -> None:
-    """Make data_dir and vector DB path agree for read-oriented commands."""
-    config.data_dir = data_dir
-    config.vector_db.persist_directory = str(data_dir / "chromadb")
+# Shared with the CLI and the web command deck — see src/session.py.
+_load_config = load_config
+_apply_video_slug = apply_video_slug
+_point_config_at_data_dir = point_config_at_data_dir
 
 
 def _model_label(config: ScreenLensConfig) -> str:
-    if config.captioning.backend == CaptionBackend.omlx:
-        return f"{resolve_omlx_model(config.captioning)} via oMLX"
+    if config.captioning.backend in (CaptionBackend.vllm, CaptionBackend.omlx):
+        return f"{resolve_inference_model(config.captioning)} via {config.captioning.backend.value}"
     return f"{config.captioning.ollama_model} via Ollama"
 
 
 def _summary_rows(config: ScreenLensConfig, config_path: Path | None) -> list[tuple[str, str]]:
     """Return display rows for the current configuration."""
     config_label = str(config_path.resolve()) if config_path and config_path.exists() else "defaults"
+    if config.captioning.backend == CaptionBackend.ollama:
+        inference_url = config.captioning.ollama_base_url
+        inference_key = "n/a"
+    else:
+        inference_url = resolve_inference_base_url(config.captioning)
+        inference_key = _yes_no(bool(resolve_inference_api_key(config.captioning)))
     return [
         ("Config", config_label),
         ("Data dir", str(config.data_dir)),
@@ -73,8 +58,9 @@ def _summary_rows(config: ScreenLensConfig, config_path: Path | None) -> list[tu
         ("Model", _model_label(config)),
         ("Batch size", str(config.captioning.batch_size)),
         ("Caption tokens", f"{config.captioning.max_tokens:,}"),
-        ("oMLX URL", resolve_omlx_base_url(config.captioning)),
-        ("oMLX key", _yes_no(bool(resolve_omlx_api_key(config.captioning)))),
+        ("Reconstruct timeout", f"{config.reconstruction.timeout_seconds:g}s"),
+        ("Inference URL", inference_url),
+        ("Inference key", inference_key),
         ("Embedding", f"{config.embedding.model_name} on {config.embedding.device}"),
     ]
 
@@ -103,27 +89,14 @@ def _is_omlx_auth_error(error: Exception) -> bool:
 
 
 def _fetch_omlx_model_ids(config: ScreenLensConfig, timeout: float = 10.0) -> list[str]:
-    """Fetch model ids from the configured oMLX /v1/models endpoint."""
-    key = resolve_omlx_api_key(config.captioning)
-    if not key:
-        raise ValueError("MLX_API_KEY/OMLX_API_KEY not set")
-
-    url = f"{resolve_omlx_base_url(config.captioning).rstrip('/')}/models"
-    req = request.Request(url, headers={"Authorization": f"Bearer {key}"})
-    try:
-        with request.urlopen(req, timeout=timeout) as resp:
-            payload = json.load(resp)
-    except HTTPError as exc:
-        detail = exc.read().decode("utf-8", "replace").strip()
-        raise RuntimeError(f"oMLX model list failed with HTTP {exc.code}: {detail}") from exc
-
-    model_ids = [
-        str(item["id"])
-        for item in payload.get("data", [])
-        if isinstance(item, dict) and item.get("id")
-    ]
+    """Fetch model ids from the configured direct provider."""
+    model_ids = list_models(
+        resolve_inference_base_url(config.captioning),
+        resolve_inference_api_key(config.captioning),
+        timeout,
+    )
     if not model_ids:
-        raise ValueError("oMLX returned no model ids")
+        raise ValueError("Inference server returned no model ids")
     return model_ids
 
 
@@ -271,12 +244,12 @@ def run_tui(config_path: str | Path | None = None) -> int:
                     yield Button("Quit", id="quit", variant="error")
                 with Horizontal(classes="row"):
                     yield Select(
-                        [("oMLX", "omlx"), ("Ollama", "ollama")],
-                        value="omlx",
+                        [("vLLM (DGX Spark)", "vllm"), ("oMLX", "omlx"), ("Ollama", "ollama")],
+                        value=ScreenLensConfig().captioning.backend.value,
                         allow_blank=False,
                         id="backend",
                     )
-                    yield Select([], prompt="Select oMLX model", allow_blank=True, id="omlx-model")
+                    yield Select([], prompt="Select inference model", allow_blank=True, id="omlx-model")
                     yield Button("Refresh Models", id="refresh-models", variant="default")
                 with Horizontal(classes="row"):
                     yield Input(placeholder="Video path for ingest/reconstruct", id="video-path")
@@ -321,6 +294,9 @@ def run_tui(config_path: str | Path | None = None) -> int:
 
         def on_select_changed(self, event: Select.Changed) -> None:
             if event.select.id == "backend":
+                self.selected_omlx_model = None
+                self.omlx_model_ids = []
+                self.models_refresh_attempted = False
                 self._validate_config(write_success=False)
             elif event.select.id == "omlx-model" and event.value != Select.NULL:
                 self.selected_omlx_model = str(event.value)
@@ -330,8 +306,8 @@ def run_tui(config_path: str | Path | None = None) -> int:
 
         def action_refresh_models(self) -> None:
             config = self._build_config_from_controls()
-            if config.captioning.backend != CaptionBackend.omlx:
-                self.write_log("Model refresh is only available for the oMLX backend.")
+            if config.captioning.backend == CaptionBackend.ollama:
+                self.write_log("Model refresh is available for vLLM and oMLX.")
                 return
             self._refresh_omlx_models(config)
 
@@ -365,7 +341,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
             if write_success:
                 self.write_log("Configuration ready.")
             if (
-                config.captioning.backend == CaptionBackend.omlx
+                config.captioning.backend in (CaptionBackend.vllm, CaptionBackend.omlx)
                 and not self.models_refresh_attempted
                 and not self.models_loading
             ):
@@ -379,10 +355,16 @@ def run_tui(config_path: str | Path | None = None) -> int:
         def _build_config_from_controls(self) -> ScreenLensConfig:
             config = _load_config(self._config_path())
 
-            backend_value = str(self.query_one("#backend", Select).value or "omlx")
+            backend_value = str(
+                self.query_one("#backend", Select).value
+                or ScreenLensConfig().captioning.backend.value
+            )
             config.captioning.backend = CaptionBackend(backend_value)
             if self.selected_omlx_model:
-                config.captioning.omlx_model = self.selected_omlx_model
+                if config.captioning.backend == CaptionBackend.vllm:
+                    config.captioning.vllm_model = self.selected_omlx_model
+                elif config.captioning.backend == CaptionBackend.omlx:
+                    config.captioning.omlx_model = self.selected_omlx_model
 
             data_dir = Path(self.query_one("#data-dir", Input).value.strip() or "./data")
             _point_config_at_data_dir(config, data_dir)
@@ -391,14 +373,14 @@ def run_tui(config_path: str | Path | None = None) -> int:
         def _configure_omlx_selector(self, config: ScreenLensConfig) -> None:
             select = self.query_one("#omlx-model", Select)
             refresh = self.query_one("#refresh-models", Button)
-            if config.captioning.backend != CaptionBackend.omlx:
+            if config.captioning.backend == CaptionBackend.ollama:
                 select.set_options([])
-                select.prompt = "Backend is not oMLX"
+                select.prompt = "Ollama model is configured separately"
                 select.disabled = True
                 refresh.disabled = True
                 return
 
-            configured_model = resolve_omlx_model(config.captioning)
+            configured_model = resolve_inference_model(config.captioning)
             options = _omlx_model_options(self.omlx_model_ids, configured_model)
             select.set_options(options)
             selected = self.selected_omlx_model or configured_model
@@ -406,7 +388,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 selected = options[0][1] if options else configured_model
             if options:
                 select.value = selected
-            select.prompt = "Loading oMLX models..." if self.models_loading else "Select oMLX model"
+            select.prompt = "Loading models..." if self.models_loading else "Select inference model"
             select.disabled = self.running or self.models_loading or not options
             refresh.disabled = self.running or self.models_loading
             self.selected_omlx_model = selected
@@ -417,7 +399,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
             self.models_refresh_attempted = True
             self.models_loading = True
             self.query_one("#refresh-models", Button).disabled = True
-            self.query_one("#omlx-model", Select).prompt = "Loading oMLX models..."
+            self.query_one("#omlx-model", Select).prompt = "Loading models..."
             self.run_worker(
                 lambda: self._load_omlx_models(config),
                 name="omlx-model-refresh",
@@ -441,11 +423,11 @@ def run_tui(config_path: str | Path | None = None) -> int:
             config: ScreenLensConfig,
         ) -> None:
             self.models_loading = False
-            if config.captioning.backend != CaptionBackend.omlx:
+            if config.captioning.backend == CaptionBackend.ollama:
                 self._configure_omlx_selector(config)
                 return
 
-            configured_model = resolve_omlx_model(config.captioning)
+            configured_model = resolve_inference_model(config.captioning)
             if error is None:
                 self.omlx_model_ids = models
             options = _omlx_model_options(self.omlx_model_ids, configured_model)
@@ -462,14 +444,14 @@ def run_tui(config_path: str | Path | None = None) -> int:
             if error and not self.omlx_model_ids:
                 select.prompt = OMLX_AUTH_HINT if _is_omlx_auth_error(error) else "Model list unavailable"
             elif not options:
-                select.prompt = "No vision-capable oMLX models found"
+                select.prompt = "No vision-capable models found"
             else:
-                select.prompt = "Select oMLX model"
+                select.prompt = "Select inference model"
             select.disabled = self.running or not options
             self.query_one("#refresh-models", Button).disabled = self.running
 
             if error:
-                self.write_log(f"Could not load oMLX models: {type(error).__name__}: {error}")
+                self.write_log(f"Could not load inference models: {type(error).__name__}: {error}")
                 hint = f" {OMLX_AUTH_HINT}" if _is_omlx_auth_error(error) else ""
                 self._update_status(
                     f"Ready; using {configured_model}. Model list unavailable.{hint}",
@@ -478,7 +460,7 @@ def run_tui(config_path: str | Path | None = None) -> int:
                 return
             filtered = len(models) - len(options)
             suffix = f" ({filtered} text-only hidden)" if filtered else ""
-            self.write_log(f"Loaded {len(options)} vision-capable oMLX model(s){suffix}.")
+            self.write_log(f"Loaded {len(options)} vision-capable model(s){suffix}.")
             self.current_config = self._build_config_from_controls()
             self._update_summary(_summary_rows(self.current_config, self._config_path()))
 
@@ -651,12 +633,12 @@ def run_tui(config_path: str | Path | None = None) -> int:
             ):
                 self.query_one(f"#{button_id}", Button).disabled = running
             self.query_one("#backend", Select).disabled = running
-            non_omlx = (
+            no_direct_model_list = (
                 self.current_config is not None
-                and self.current_config.captioning.backend != CaptionBackend.omlx
+                and self.current_config.captioning.backend == CaptionBackend.ollama
             )
-            self.query_one("#omlx-model", Select).disabled = running or non_omlx
-            self.query_one("#refresh-models", Button).disabled = running or non_omlx
+            self.query_one("#omlx-model", Select).disabled = running or no_direct_model_list
+            self.query_one("#refresh-models", Button).disabled = running or no_direct_model_list
             if running:
                 self._update_status("Running...", "yellow")
 

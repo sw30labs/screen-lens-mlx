@@ -12,6 +12,7 @@ Backends: OpenCV (default), ffmpeg (fallback), decord (optional).
 import json
 import subprocess
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -28,7 +29,10 @@ logger = logging.getLogger("screenlens.frame_extractor")
 # ── Video Metadata ──────────────────────────────────────────────────────────
 
 def get_video_metadata(video_path: str) -> dict:
-    """Extract video metadata using ffprobe."""
+    """Extract video metadata using ffprobe when the optional binary exists."""
+    if shutil.which("ffprobe") is None:
+        logger.info("ffprobe is unavailable; reading video metadata with OpenCV")
+        return {}
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams", video_path

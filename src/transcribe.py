@@ -8,9 +8,8 @@ Verbatim transcription pipeline (the new primary path).
       → LLM cleanup       (seams + indentation ONLY, optional)     this file
       → output/transcript.md
 
-Everything is local: vision OCR + text cleanup both go through the oMLX
-OpenAI-compatible server. The two models are intentionally separate — a vision
-model reads the pixels, a text model tidies seams.
+Everything is local: vision OCR + text cleanup both use the selected
+OpenAI-compatible server (vLLM on DGX Spark or oMLX on Apple Silicon).
 """
 from __future__ import annotations
 
@@ -23,7 +22,15 @@ from pathlib import Path
 from .config import ScreenLensConfig
 from .frame_select import select_frames
 from .ocr import VerbatimOCR
-from .omlx_client import OMLXClient, normalize_omlx_base_url, resolve_llm_model, _env_value
+from .omlx_client import (
+    InferenceClient,
+    degenerate_repetition,
+    resolve_llm_model,
+    resolve_role_api_key,
+    resolve_role_backend,
+    resolve_role_base_url,
+    resolve_role_context,
+)
 from .stitch import stitch_frames
 
 logger = logging.getLogger("screenlens.transcribe")
@@ -66,15 +73,15 @@ CLEANUP_SYSTEM = (
 )
 
 
-def _llm_client(cfg) -> OMLXClient:
+def _llm_client(cfg) -> InferenceClient:
     rc = cfg.reconstruction
-    api_key = rc.api_key or _env_value("LLM_API_KEY", "MLX_API_KEY", "OMLX_API_KEY",
-                                       ignore_placeholders=True)
-    return OMLXClient.from_endpoint(
-        base_url=normalize_omlx_base_url(rc.base_url),
+    return InferenceClient.from_endpoint(
+        base_url=resolve_role_base_url(rc),
         model=resolve_llm_model(rc),
-        api_key=api_key,
+        api_key=resolve_role_api_key(rc, "VLLM_LLM_API_KEY", "LLM_API_KEY"),
+        backend=resolve_role_backend(rc),
         timeout=rc.timeout_seconds,
+        context_size=resolve_role_context(rc),
         default_max_tokens=rc.max_tokens,
         default_temperature=rc.temperature,
     )
@@ -162,6 +169,24 @@ def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) 
     non_empty = sum(1 for t in texts if t.strip())
     logger.info("OCR done: %d/%d frames had text", non_empty, len(texts))
 
+    # The raw transcript stays byte-faithful to what the model read, so a frame
+    # where the model got stuck is reported rather than edited — trimming it
+    # here could just as easily delete a screen that genuinely repeats.
+    degenerate_frames = [
+        f["frame_id"]
+        for f, txt in zip(frames, texts)
+        if degenerate_repetition(txt) is not None
+    ]
+    for frame_id, txt in ((f["frame_id"], t) for f, t in zip(frames, texts)):
+        unit = degenerate_repetition(txt)
+        if unit is not None:
+            logger.warning(
+                "frame %d OCR ends in a repetition loop (%r repeated); the "
+                "transcript keeps it verbatim, but treat that frame as suspect.",
+                frame_id,
+                unit,
+            )
+
     # 3. Stitch (text-space dedup) ───────────────────────────────────────────
     frames_lines = [t.splitlines() for t in texts]
     stitched = stitch_frames(frames_lines, fuzzy=0.85, strip_boilerplate=True)
@@ -189,6 +214,7 @@ def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) 
         "video": str(Path(video_path).resolve()),
         "frames_selected": len(frames),
         "frames_with_text": non_empty,
+        "degenerate_frames": degenerate_frames,
         "ocr_model": ocr.model,
         "llm_model": resolve_llm_model(config.reconstruction) if config.reconstruction.enabled else None,
         "transcript_path": str(clean_path),

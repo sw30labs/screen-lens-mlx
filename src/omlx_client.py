@@ -1,8 +1,8 @@
-"""Small oMLX/OpenAI-compatible client used by ScreenLens.
+"""Small OpenAI-compatible inference client used by ScreenLens.
 
-The local oMLX server exposes an OpenAI-compatible ``/v1/chat/completions``
-endpoint, including vision inputs. This module keeps that dependency as a
-plain HTTP adapter so the rest of the pipeline does not need the OpenAI SDK.
+Both vLLM on DGX Spark and oMLX on Apple Silicon expose the same
+``/v1/chat/completions`` contract, including OpenAI-style vision inputs.  The
+legacy module and ``OMLXClient`` names remain as compatibility aliases.
 """
 from __future__ import annotations
 
@@ -17,19 +17,40 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import CaptioningConfig
+from .config import (
+    CaptionBackend,
+    CaptioningConfig,
+    InferenceBackend,
+    load_dotenv_if_present,
+)
 
-logger = logging.getLogger("screenlens.omlx")
+logger = logging.getLogger("screenlens.inference")
 
 
 DEFAULT_OMLX_BASE_URL = "http://127.0.0.1:8000/v1"
-_DOTENV_LOADED = False
-_OMLX_KEY_PLACEHOLDERS = {
+DEFAULT_VLLM_BASE_URL = "http://127.0.0.1:8000/v1"
+DEFAULT_VLLM_MODEL = "nvidia/Qwen3.6-27B-NVFP4"
+DEFAULT_VLLM_CONTEXT = 32768
+_VLLM_CONTEXT_ERROR_PARAMS = {"input_tokens", "input_text"}
+_TOKENIZE_CHAT_FIELDS = {
+    "model",
+    "messages",
+    "add_generation_prompt",
+    "continue_final_message",
+    "chat_template",
+    "chat_template_kwargs",
+    "media_io_kwargs",
+    "mm_processor_kwargs",
+    "tools",
+}
+_API_KEY_PLACEHOLDERS = {
     "your-api-key",
     "your-api-key-here",
     "your-omlx-api-key",
     "your-omlx-api-key-here",
+    "hf_replace_me",
 }
+_OMLX_KEY_PLACEHOLDERS = _API_KEY_PLACEHOLDERS
 # Known text-only families. A vision marker (below) always overrides — so e.g.
 # "MiniMax-VL" is still treated as vision even though "minimax" is listed here.
 _KNOWN_TEXT_ONLY_PATTERNS = (
@@ -65,6 +86,98 @@ _DRAFT_MARKERS = ("dflash", "draft", "eagle")
 _DRAFT_RE = re.compile(r"(^|-)mtp(-|$)")
 
 
+class InferenceTruncatedError(RuntimeError):
+    """Raised when a caller requires a complete generation but receives a prefix."""
+
+    def __init__(self, backend: str, completion_limit: int | str):
+        self.backend = backend
+        self.completion_limit = completion_limit
+        super().__init__(
+            f"{backend} truncated the response at {completion_limit} "
+            "(finish_reason=length); incomplete output was discarded"
+        )
+
+
+class InferenceDegenerateError(RuntimeError):
+    """Raised when a required generation is degenerate repetition, not an answer."""
+
+    def __init__(self, backend: str, model: str, sample: str):
+        self.backend = backend
+        self.model = model
+        super().__init__(
+            f"{backend} model {model} returned degenerate repeated output "
+            f"({sample!r}…); it was discarded rather than saved as a result"
+        )
+
+
+# A model that loses coherence emits one token forever. Left unchecked that
+# lands in summary.md or a reconstructed artifact and is reported as success.
+_DEGENERATE_MIN_CHARS = 200
+_DEGENERATE_REPEAT_RATIO = 0.6
+# A stuck decoder repeats one short token, not a paragraph. Bounding the unit
+# length and demanding many repeats keeps legitimately repetitive reconstructed
+# code (identical short statements, table rows) out of the net.
+_DEGENERATE_MAX_UNIT = 24
+_DEGENERATE_MIN_REPEATS = 6
+
+
+def degenerate_repetition(text: str | None) -> str | None:
+    """Return the repeated unit when ``text`` is mostly one repeated token.
+
+    Deliberately narrow: it looks for a single short unit repeated back-to-back
+    over most of the output (e.g. a BOS token emitted forever), not for prose
+    or code that merely repeats a phrase.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    total = len(stripped)
+    if total < _DEGENERATE_MIN_CHARS:
+        return None
+    # Anchor on the tail: a run that loses coherence never recovers, so the
+    # repetition ends the output even when sane text precedes it ("E0000…").
+    for unit_len in range(1, _DEGENERATE_MAX_UNIT + 1):
+        unit = stripped[-unit_len:]
+        if not unit.strip():
+            continue
+        repeats = 0
+        end = total
+        while end >= unit_len and stripped.startswith(unit, end - unit_len):
+            repeats += 1
+            end -= unit_len
+        if repeats >= _DEGENERATE_MIN_REPEATS and (total - end) >= total * _DEGENERATE_REPEAT_RATIO:
+            return unit
+    return None
+
+
+# Models whose chat template mishandles a system turn on the OpenAI-compatible
+# path. Verified on DeepSeek-V4-Flash-0731-MLX under oMLX (2026-08): a
+# multi-sentence system message makes it emit its BOS token until the token
+# budget runs out, while the identical instruction folded into the user turn
+# answers normally. The template has no `system` branch in its message loop —
+# it splices the content in raw ahead of `<｜User｜>`.
+_SYSTEM_ROLE_BROKEN_PATTERNS = ("deepseek-v4",)
+
+
+def mishandles_system_role(model_id: str | None) -> bool:
+    """True when the system prompt must be folded into the user turn."""
+    if not model_id:
+        return False
+    return any(p in normalized_model_id(model_id) for p in _SYSTEM_ROLE_BROKEN_PATTERNS)
+
+
+def _prepend_instruction(system_prompt: str, user_content: Any) -> Any:
+    """Put ``system_prompt`` at the head of a user turn, text or content blocks."""
+    if isinstance(user_content, str):
+        return f"{system_prompt}\n\n{user_content}"
+    blocks = list(user_content)
+    for index, block in enumerate(blocks):
+        if block.get("type") == "text":
+            blocks[index] = {**block, "text": f"{system_prompt}\n\n{block.get('text', '')}"}
+            return blocks
+    return [{"type": "text", "text": system_prompt}, *blocks]
+
+
 def is_draft_model(model_id: str | None) -> bool:
     """True for speculative-decode draft models (not usable standalone)."""
     if not model_id:
@@ -73,60 +186,30 @@ def is_draft_model(model_id: str | None) -> bool:
     return any(m in n for m in _DRAFT_MARKERS) or bool(_DRAFT_RE.search(n))
 
 
-def _load_dotenv_if_present() -> None:
-    """Load simple KEY=VALUE entries from .env without overriding the shell."""
-    global _DOTENV_LOADED
-    if _DOTENV_LOADED:
-        return
-    _DOTENV_LOADED = True
-
-    repo_root = Path(__file__).resolve().parents[1]
-    candidates = [Path.cwd() / ".env", repo_root / ".env"]
-    seen: set[Path] = set()
-    for env_path in candidates:
-        env_path = env_path.resolve()
-        if env_path in seen or not env_path.exists():
-            continue
-        seen.add(env_path)
-        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if line.startswith("export "):
-                line = line[7:].lstrip()
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            key = key.strip()
-            if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
-                continue
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                value = value[1:-1]
-            else:
-                value = re.split(r"\s+#", value, maxsplit=1)[0].strip()
-            os.environ.setdefault(key, value)
-
-
 def _env_value(*names: str, ignore_placeholders: bool = False) -> str | None:
-    _load_dotenv_if_present()
+    load_dotenv_if_present()
     for name in names:
         value = os.getenv(name)
         if not value:
             continue
         value = value.strip()
-        if ignore_placeholders and value.lower() in _OMLX_KEY_PLACEHOLDERS:
+        if ignore_placeholders and value.lower() in _API_KEY_PLACEHOLDERS:
             continue
         return value
     return None
 
 
-def normalize_omlx_base_url(url: str) -> str:
-    """Accept oMLX root/dashboard/API URLs and return the ``/v1`` base URL."""
+def normalize_api_base_url(url: str) -> str:
+    """Normalize a root, dashboard, or API URL to an OpenAI ``/v1`` base."""
     parsed = urlsplit(url)
     if parsed.path in ("", "/") or parsed.path.startswith("/admin"):
         return urlunsplit((parsed.scheme, parsed.netloc, "/v1", "", ""))
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path.rstrip("/"), "", ""))
+
+
+def normalize_omlx_base_url(url: str) -> str:
+    """Compatibility alias for :func:`normalize_api_base_url`."""
+    return normalize_api_base_url(url)
 
 
 def resolve_omlx_base_url(config: CaptioningConfig) -> str:
@@ -134,8 +217,8 @@ def resolve_omlx_base_url(config: CaptioningConfig) -> str:
     env_url = _env_value("MLX_BASE_URL", "OMLX_BASE_URL")
     configured = config.omlx_base_url
     if configured and configured != DEFAULT_OMLX_BASE_URL:
-        return normalize_omlx_base_url(configured)
-    return normalize_omlx_base_url(env_url or configured or DEFAULT_OMLX_BASE_URL)
+        return normalize_api_base_url(configured)
+    return normalize_api_base_url(env_url or configured or DEFAULT_OMLX_BASE_URL)
 
 
 def resolve_omlx_api_key(config: CaptioningConfig) -> str | None:
@@ -156,14 +239,149 @@ def resolve_omlx_model(config: CaptioningConfig) -> str:
     )
 
 
-# Default OCR (vision) model. Prefer whatever vision model is already served by
-# your oMLX; override via OCR_MODEL env or ocr.model. Qwen3.x and Gemma-3/4 are
-# unified multimodal and strong at dense-text/screen OCR.
+def resolve_vllm_base_url(config: CaptioningConfig) -> str:
+    """Resolve a direct vLLM endpoint with explicit config taking precedence."""
+    configured = config.vllm_base_url
+    env_url = _env_value("VLLM_BASE_URL")
+    if configured and configured != DEFAULT_VLLM_BASE_URL:
+        return normalize_api_base_url(configured)
+    return normalize_api_base_url(env_url or configured or DEFAULT_VLLM_BASE_URL)
+
+
+def resolve_vllm_api_key(config: CaptioningConfig) -> str:
+    """Resolve vLLM auth; the bundled loopback service accepts ``local``."""
+    return config.vllm_api_key or _env_value(
+        "VLLM_API_KEY", ignore_placeholders=True
+    ) or "local"
+
+
+def resolve_vllm_model(config: CaptioningConfig) -> str:
+    """Resolve the model id served by vLLM on DGX Spark."""
+    return config.vllm_model or _env_value("VLLM_MODEL") or DEFAULT_VLLM_MODEL
+
+
+def resolve_inference_backend(config: CaptioningConfig) -> InferenceBackend:
+    """Return the direct backend selected for a captioning config."""
+    backend = getattr(config.backend, "value", config.backend)
+    if backend == CaptionBackend.ollama.value:
+        raise ValueError("Ollama does not use the direct OpenAI-compatible client")
+    return InferenceBackend(backend)
+
+
+def resolve_inference_base_url(config: CaptioningConfig) -> str:
+    """Resolve the selected direct provider's API root."""
+    if resolve_inference_backend(config) == InferenceBackend.vllm:
+        return resolve_vllm_base_url(config)
+    return resolve_omlx_base_url(config)
+
+
+def resolve_inference_api_key(config: CaptioningConfig) -> str | None:
+    """Resolve the selected direct provider's bearer token."""
+    if resolve_inference_backend(config) == InferenceBackend.vllm:
+        return resolve_vllm_api_key(config)
+    return resolve_omlx_api_key(config)
+
+
+def resolve_inference_model(config: CaptioningConfig) -> str:
+    """Resolve the selected direct provider's model id."""
+    if resolve_inference_backend(config) == InferenceBackend.vllm:
+        return resolve_vllm_model(config)
+    return resolve_omlx_model(config)
+
+
+def resolve_inference_context(config: CaptioningConfig) -> int:
+    """Return the configured context size used for prompt chunk planning."""
+    if resolve_inference_backend(config) == InferenceBackend.vllm:
+        env_context = _env_value("VLLM_MAX_MODEL_LEN")
+        if config.vllm_model_context == DEFAULT_VLLM_CONTEXT and env_context:
+            try:
+                parsed = int(env_context)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+        return config.vllm_model_context
+    return config.omlx_model_context
+
+
+def resolve_role_backend(config: Any) -> InferenceBackend:
+    """Resolve an OCR/reconstruction config's direct backend."""
+    backend = getattr(config, "backend", None)
+    value = getattr(backend, "value", backend) or InferenceBackend.omlx.value
+    return InferenceBackend(value)
+
+
+def resolve_role_base_url(config: Any) -> str:
+    """Resolve an OCR/reconstruction endpoint with provider env aliases."""
+    configured = getattr(config, "base_url", None)
+    backend = resolve_role_backend(config)
+    env_url = _env_value("VLLM_BASE_URL") if backend == InferenceBackend.vllm else _env_value(
+        "MLX_BASE_URL", "OMLX_BASE_URL"
+    )
+    default = DEFAULT_VLLM_BASE_URL if backend == InferenceBackend.vllm else DEFAULT_OMLX_BASE_URL
+    if configured and configured != default:
+        return normalize_api_base_url(configured)
+    return normalize_api_base_url(env_url or configured or default)
+
+
+def resolve_role_context(config: Any) -> int:
+    """Resolve role-specific context planning against the vLLM serving limit."""
+    configured = int(getattr(config, "model_context", DEFAULT_VLLM_CONTEXT))
+    if (
+        resolve_role_backend(config) == InferenceBackend.vllm
+        and configured == DEFAULT_VLLM_CONTEXT
+    ):
+        env_context = _env_value("VLLM_MAX_MODEL_LEN")
+        if env_context:
+            try:
+                parsed = int(env_context)
+                if parsed > 0:
+                    return parsed
+            except ValueError:
+                pass
+    return configured
+
+
+def resolve_role_api_key(config: Any, *preferred_names: str) -> str | None:
+    """Resolve OCR/reconstruction auth without conflating vLLM and MLX envs."""
+    configured = getattr(config, "api_key", None)
+    if configured:
+        return configured
+    backend = resolve_role_backend(config)
+    if backend == InferenceBackend.vllm:
+        vllm_names = tuple(name for name in preferred_names if name.startswith("VLLM_"))
+        return _env_value(
+            *vllm_names, "VLLM_API_KEY", ignore_placeholders=True
+        ) or "local"
+    omlx_names = tuple(name for name in preferred_names if not name.startswith("VLLM_"))
+    return _env_value(
+        *omlx_names,
+        "MLX_API_KEY",
+        "OMLX_API_KEY",
+        ignore_placeholders=True,
+    )
+
+
+# Default oMLX models per role. The vLLM path uses the single model served by
+# Spark for both roles; on Apple Silicon the roles are normally two different
+# checkpoints, because a vision model is wasted on text reasoning and a text
+# model cannot see frames at all.
 RECOMMENDED_OCR_MODEL = "Qwen3.6-27B-bf16"
+# Qwen3.6 serves the text role too. A dedicated text model is welcome here, but
+# it must survive ScreenLens's actual inputs: captions are markdown with
+# indented list items, and DeepSeek-V4-Flash under oMLX emits its BOS token to
+# the token limit on exactly that shape (see degenerate_repetition).
+RECOMMENDED_TEXT_MODEL = "Qwen3.6-27B-bf16"
 
 
 def resolve_ocr_model(config) -> str:
     """Resolve the OCR (vision) model id from an OCRConfig-like object."""
+    if resolve_role_backend(config) == InferenceBackend.vllm:
+        return (
+            getattr(config, "model", None)
+            or _env_value("VLLM_OCR_MODEL", "VLLM_MODEL")
+            or DEFAULT_VLLM_MODEL
+        )
     return (
         getattr(config, "model", None)
         or _env_value("OCR_MODEL", "MLX_VISION_MODEL", "MLX_OCR_MODEL")
@@ -173,25 +391,40 @@ def resolve_ocr_model(config) -> str:
 
 def resolve_llm_model(config) -> str:
     """Resolve the text-LLM id from a ReconstructionConfig-like object."""
+    if resolve_role_backend(config) == InferenceBackend.vllm:
+        return (
+            getattr(config, "model", None)
+            or _env_value("VLLM_LLM_MODEL", "VLLM_MODEL")
+            or DEFAULT_VLLM_MODEL
+        )
     return (
         getattr(config, "model", None)
         or _env_value("LLM_MODEL", "MLX_MODEL", "OMLX_MODEL")
-        or "default"
+        or RECOMMENDED_TEXT_MODEL
     )
 
 
+def _urlopen(req: request.Request, timeout: float):
+    """Open an API request, bypassing inherited proxies for loopback servers."""
+    host = (urlsplit(req.full_url).hostname or "").lower()
+    if host in {"127.0.0.1", "localhost", "::1"}:
+        opener = request.build_opener(request.ProxyHandler({}))
+        return opener.open(req, timeout=timeout)
+    return request.urlopen(req, timeout=timeout)
+
+
 def list_models(base_url: str, api_key: str | None = None, timeout: float = 30.0) -> list[str]:
-    """Return served model ids from the oMLX ``/v1/models`` endpoint."""
-    base = normalize_omlx_base_url(base_url)
+    """Return served model ids from an OpenAI-compatible ``/v1/models`` endpoint."""
+    base = normalize_api_base_url(base_url)
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     req = request.Request(f"{base}/models", headers=headers, method="GET")
     try:
-        with request.urlopen(req, timeout=timeout) as resp:
+        with _urlopen(req, timeout=timeout) as resp:
             data = json.load(resp)
     except (HTTPError, URLError) as exc:  # pragma: no cover - network
-        raise RuntimeError(f"Could not list oMLX models at {base}/models: {exc}") from exc
+        raise RuntimeError(f"Could not list inference models at {base}/models: {exc}") from exc
     items = data.get("data") or data.get("models") or []
     out = []
     for it in items:
@@ -227,10 +460,15 @@ def is_known_text_only_model(model_id: str | None) -> bool:
 
 
 def validate_omlx_vision_model(model_id: str) -> None:
+    """Compatibility alias for :func:`validate_vision_model`."""
+    validate_vision_model(model_id)
+
+
+def validate_vision_model(model_id: str) -> None:
     """Raise an actionable error if the selected model is known text-only."""
     if is_known_text_only_model(model_id):
         raise ValueError(
-            f"{model_id} is a text-only oMLX model. ScreenLens captioning sends "
+            f"{model_id} is a text-only model. ScreenLens captioning sends "
             "image inputs, so choose a vision-capable model such as a VL, vision, "
             "omni, or Janus model."
         )
@@ -284,15 +522,21 @@ def _message_text(content: Any) -> str:
     return "" if content is None else str(content)
 
 
-class OMLXClient:
-    """Minimal chat client for an oMLX OpenAI-compatible server."""
+class OpenAICompatibleClient:
+    """Minimal chat client shared by vLLM and oMLX."""
 
     def __init__(self, config: CaptioningConfig):
         self.config = config
-        self.base_url = resolve_omlx_base_url(config)
-        self.model = resolve_omlx_model(config)
-        self.api_key = resolve_omlx_api_key(config)
-        self.timeout = config.omlx_timeout_seconds
+        self.backend = resolve_inference_backend(config)
+        self.base_url = resolve_inference_base_url(config)
+        self.model = resolve_inference_model(config)
+        self.api_key = resolve_inference_api_key(config)
+        self.timeout = (
+            config.vllm_timeout_seconds
+            if self.backend == InferenceBackend.vllm
+            else config.omlx_timeout_seconds
+        )
+        self.context_size = resolve_inference_context(config)
         self._default_max_tokens = config.max_tokens
         self._default_temperature = config.temperature
 
@@ -303,10 +547,12 @@ class OMLXClient:
         base_url: str,
         model: str,
         api_key: str | None,
+        backend: str | InferenceBackend = InferenceBackend.omlx,
         timeout: float = 600.0,
-        default_max_tokens: int = 4096,
+        context_size: int = 32768,
+        default_max_tokens: int = 32768,
         default_temperature: float = 0.0,
-    ) -> "OMLXClient":
+    ) -> "OpenAICompatibleClient":
         """Build a client directly from endpoint params (no CaptioningConfig).
 
         Used by the verbatim OCR pass (vision model) and the reconstruction pass
@@ -314,10 +560,12 @@ class OMLXClient:
         """
         self = cls.__new__(cls)
         self.config = None
-        self.base_url = normalize_omlx_base_url(base_url)
+        self.backend = InferenceBackend(getattr(backend, "value", backend))
+        self.base_url = normalize_api_base_url(base_url)
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.context_size = context_size
         self._default_max_tokens = default_max_tokens
         self._default_temperature = default_temperature
         return self
@@ -343,9 +591,10 @@ class OMLXClient:
         max_tokens: int | None = None,
         temperature: float | None = None,
         extra: dict[str, Any] | None = None,
+        require_complete: bool = False,
     ) -> str:
         if images:
-            validate_omlx_vision_model(self.model)
+            validate_vision_model(self.model)
 
         user_content: str | list[dict[str, Any]]
         if images:
@@ -357,23 +606,152 @@ class OMLXClient:
         else:
             user_content = user_prompt
 
-        payload = {
-            "model": self.model,
-            "messages": [
+        requested_max_tokens = (
+            max_tokens if max_tokens is not None else self._default_max_tokens
+        )
+        if system_prompt and mishandles_system_role(self.model):
+            # See _SYSTEM_ROLE_BROKEN_PATTERNS: a system turn makes these models
+            # emit their BOS token until the budget runs out. The same
+            # instruction at the head of the user turn answers normally.
+            messages = [{"role": "user", "content": _prepend_instruction(system_prompt, user_content)}]
+        else:
+            messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
-            ],
-            "max_tokens": max_tokens if max_tokens is not None else self._default_max_tokens,
+            ]
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
             "temperature": temperature if temperature is not None else self._default_temperature,
             "stream": False,
         }
+        # vLLM's context limit includes the chat template, prompt, image tokens,
+        # and completion. Reserving the entire 32K window as max_tokens leaves
+        # zero room for input and is rejected. Omitting the field at that ceiling
+        # makes vLLM compute max_model_len - actual_input_length, which is the
+        # largest valid completion budget for each image. Explicit smaller caps
+        # remain exact, and oMLX retains its existing explicit-field behavior.
+        if not (
+            self.backend == InferenceBackend.vllm
+            and requested_max_tokens >= self.context_size
+        ):
+            payload["max_tokens"] = requested_max_tokens
         # Pass-through sampler controls (repetition_penalty, no_repeat_ngram_size,
-        # etc.). Unknown keys are ignored by most OpenAI-compatible MLX servers.
+        # etc.). Both the bundled vLLM recipe and current oMLX accept these.
         if extra:
             payload.update({k: v for k, v in extra.items() if v is not None})
+        if require_complete:
+            return strip_thinking(
+                self._post_chat(payload, require_complete=True)
+            )
         return strip_thinking(self._post_chat(payload))
 
-    def _post_chat(self, payload: dict[str, Any]) -> str:
+    def _tokenize_url(self) -> str:
+        """Return vLLM's root-level tokenization endpoint URL."""
+        parsed = urlsplit(self.base_url)
+        path = parsed.path.rstrip("/")
+        if path.endswith("/v1"):
+            path = path[:-3]
+        return urlunsplit((parsed.scheme, parsed.netloc, f"{path}/tokenize", "", ""))
+
+    def _tokenize_chat(self, payload: dict[str, Any]) -> tuple[int, int] | None:
+        """Ask vLLM for the exact rendered chat token count, if supported."""
+        tokenize_payload = {
+            key: value
+            for key, value in payload.items()
+            if key in _TOKENIZE_CHAT_FIELDS
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        req = request.Request(
+            self._tokenize_url(),
+            data=json.dumps(tokenize_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        try:
+            with _urlopen(req, timeout=self.timeout) as resp:
+                response = json.load(resp)
+            return int(response["count"]), int(response["max_model_len"])
+        except (HTTPError, URLError, TimeoutError, KeyError, TypeError, ValueError):
+            return None
+
+    def _context_retry_payload(
+        self,
+        payload: dict[str, Any],
+        status_code: int,
+        detail: str,
+    ) -> dict[str, Any] | None:
+        """Build one exact-budget retry for a structured vLLM context error."""
+        if self.backend != InferenceBackend.vllm or status_code != 400:
+            return None
+        try:
+            decoded = json.loads(detail)
+        except json.JSONDecodeError:
+            return None
+        error = decoded.get("error", decoded) if isinstance(decoded, dict) else {}
+        if not isinstance(error, dict):
+            return None
+        message = str(error.get("message", ""))
+        if (
+            error.get("param") not in _VLLM_CONTEXT_ERROR_PARAMS
+            or "maximum context length" not in message.lower()
+        ):
+            return None
+
+        requested = payload.get("max_completion_tokens", payload.get("max_tokens"))
+        if requested is None:
+            return None
+
+        tokenized = self._tokenize_chat(payload)
+        retry = dict(payload)
+        if tokenized is None:
+            # Older vLLM builds may not expose /tokenize. Omitting both output
+            # fields lets vLLM allocate the exact remaining context itself.
+            retry.pop("max_tokens", None)
+            retry.pop("max_completion_tokens", None)
+            logger.warning(
+                "vLLM rejected the explicit completion reservation; /tokenize "
+                "is unavailable, retrying once with the remaining context."
+            )
+            return retry
+
+        prompt_tokens, max_model_len = tokenized
+        available = max_model_len - prompt_tokens
+        if available <= 0:
+            raise RuntimeError(
+                f"vllm prompt uses {prompt_tokens:,} tokens, exceeding the "
+                f"server's {max_model_len:,}-token context before any response "
+                "can be generated. Reduce or split the prompt."
+            )
+
+        retry_tokens = min(int(requested), available)
+        if retry_tokens >= int(requested):
+            return None
+        if "max_completion_tokens" in retry:
+            retry["max_completion_tokens"] = retry_tokens
+            retry.pop("max_tokens", None)
+        else:
+            retry["max_tokens"] = retry_tokens
+        logger.warning(
+            "vLLM prompt uses %s of %s context tokens; retrying once with "
+            "max_tokens=%s instead of %s.",
+            prompt_tokens,
+            max_model_len,
+            retry_tokens,
+            requested,
+        )
+        return retry
+
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        *,
+        allow_context_retry: bool = True,
+        require_complete: bool = False,
+    ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = f"Bearer {self.api_key}"
@@ -386,37 +764,92 @@ class OMLXClient:
         )
 
         try:
-            with request.urlopen(req, timeout=self.timeout) as resp:
+            with _urlopen(req, timeout=self.timeout) as resp:
                 response = json.load(resp)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace").strip()
+            if allow_context_retry:
+                retry_payload = self._context_retry_payload(payload, exc.code, detail)
+                if retry_payload is not None:
+                    return self._post_chat(
+                        retry_payload,
+                        allow_context_retry=False,
+                        require_complete=require_complete,
+                    )
             hint = ""
             if exc.code == 401:
-                hint = " Set MLX_API_KEY or OMLX_API_KEY, or pass --omlx-api-key."
+                hint = (
+                    " Set VLLM_API_KEY for vLLM or MLX_API_KEY/OMLX_API_KEY for oMLX."
+                )
             raise RuntimeError(
-                f"oMLX chat completion failed with HTTP {exc.code}: {detail}{hint}"
+                f"{self.backend.value} chat completion failed with HTTP "
+                f"{exc.code}: {detail}{hint}"
+            ) from exc
+        except TimeoutError as exc:
+            raise RuntimeError(
+                f"{self.backend.value} chat completion timed out after "
+                f"{self.timeout:g} seconds. Increase the configured request "
+                "timeout if this local model needs longer."
             ) from exc
         except URLError as exc:
             raise RuntimeError(
-                f"Could not connect to oMLX at {self.base_url}. "
-                "Start oMLX or pass --omlx-url."
+                f"Could not connect to {self.backend.value} at {self.base_url}. "
+                "Start the local inference service or pass --inference-url."
             ) from exc
 
         choices = response.get("choices") or []
         if not choices:
-            raise RuntimeError(f"oMLX response contained no choices: {response}")
+            raise RuntimeError(
+                f"{self.backend.value} response contained no choices: {response}"
+            )
 
         first = choices[0]
         if isinstance(first, dict) and first.get("finish_reason") == "length":
+            completion_limit = payload.get(
+                "max_completion_tokens",
+                payload.get("max_tokens"),
+            )
+            if completion_limit is None:
+                completion_limit = (
+                    f"remaining space in the {self.context_size}-token context"
+                )
+            if require_complete:
+                raise InferenceTruncatedError(
+                    self.backend.value,
+                    completion_limit,
+                )
             logger.warning(
-                "oMLX truncated the response at max_tokens=%s (finish_reason=length). "
-                "For a reasoning model this usually means it ran out of budget mid-"
-                "thought and never reached the answer — disable thinking or raise "
-                "max_tokens.", payload.get("max_tokens"),
+                "%s truncated the response at %s (finish_reason=length); "
+                "the returned text may be incomplete. Reduce the prompt or "
+                "increase the completion budget within the model context.",
+                self.backend.value,
+                completion_limit,
             )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):
-                return _message_text(first["message"].get("content"))
-            if "text" in first:
-                return str(first["text"])
-        return str(first)
+                text = _message_text(first["message"].get("content"))
+            elif "text" in first:
+                text = str(first["text"])
+            else:
+                text = str(first)
+        else:
+            text = str(first)
+
+        unit = degenerate_repetition(text)
+        if unit is not None:
+            if require_complete:
+                raise InferenceDegenerateError(self.backend.value, self.model, unit)
+            logger.warning(
+                "%s model %s returned degenerate repeated output (%r repeated to "
+                "the end); the result is not usable as an answer.",
+                self.backend.value,
+                self.model,
+                unit,
+            )
+        return text
+
+
+# Compatibility names for callers and serialized workflows from the oMLX-only
+# releases. New code should prefer ``InferenceClient``.
+InferenceClient = OpenAICompatibleClient
+OMLXClient = OpenAICompatibleClient

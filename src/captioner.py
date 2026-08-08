@@ -2,9 +2,9 @@
 Frame Captioning Module.
 
 Backends:
-  1. **omlx** (default) — Uses the local oMLX OpenAI-compatible VLM server.
-     Best fit for Apple Silicon with server-side batching and KV caching.
-  2. **ollama** (fallback) — Any Ollama vision model (llama3.2-vision, etc.).
+  1. **vllm** — DGX Spark's local OpenAI-compatible multimodal server.
+  2. **omlx** — Apple Silicon's local OpenAI-compatible VLM server.
+  3. **ollama** (fallback) — Any Ollama vision model.
      Works on any platform with Ollama installed.
 """
 import base64
@@ -17,44 +17,94 @@ from typing import Optional
 from tqdm import tqdm
 
 from .config import CaptioningConfig, CaptionBackend
-from .omlx_client import OMLXClient, resolve_omlx_model, validate_omlx_vision_model
+from .omlx_client import InferenceClient, resolve_inference_model, validate_vision_model
 
 logger = logging.getLogger("screenlens.captioner")
 
 
-# ── oMLX Backend ────────────────────────────────────────────────────────────
+# ── OpenAI-compatible vision backends (vLLM / oMLX) ───────────────
 
-class OMLXCaptioner:
-    """Caption frames through a local oMLX OpenAI-compatible server."""
+class OpenAICompatibleCaptioner:
+    """Caption frames through the selected direct inference server."""
 
     def __init__(self, config: CaptioningConfig):
         self.config = config
-        validate_omlx_vision_model(resolve_omlx_model(config))
-        self._client = OMLXClient(config)
+        validate_vision_model(resolve_inference_model(config))
+        self._client = InferenceClient(config)
 
-    def caption(self, image_path: str) -> str:
+    def caption(
+        self,
+        image_path: str,
+        *,
+        max_tokens: int | None = None,
+        temperature: float | None = None,
+        require_complete: bool = False,
+    ) -> str:
         """Generate a caption for a single frame."""
-        extra = (
-            {"chat_template_kwargs": {"enable_thinking": False}}
-            if self.config.disable_thinking
-            else None
-        )
+        extra = {
+            "repetition_penalty": self.config.repetition_penalty,
+            "no_repeat_ngram_size": self.config.no_repeat_ngram_size or None,
+        }
+        if self.config.disable_thinking:
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
         return self._client.chat(
             self.config.system_prompt,
             self.config.user_prompt,
             images=[image_path],
-            max_tokens=self.config.max_tokens,
-            temperature=self.config.temperature,
+            max_tokens=max_tokens if max_tokens is not None else self.config.max_tokens,
+            temperature=(
+                temperature if temperature is not None else self.config.temperature
+            ),
             extra=extra,
+            require_complete=require_complete,
         )
 
+    def _caption_with_retry(self, image_path: str) -> str:
+        """Caption one frame without allowing its failure to poison a batch."""
+        try:
+            return self.caption(image_path)
+        except Exception as exc:
+            last_error = exc
+
+        retry_max_tokens = min(
+            self.config.max_tokens,
+            self.config.retry_max_tokens,
+        )
+        for attempt in range(1, self.config.retry_attempts + 1):
+            logger.warning(
+                "Caption request failed for %s (%s); retrying %s/%s with "
+                "max_tokens=%s",
+                Path(image_path).name,
+                last_error,
+                attempt,
+                self.config.retry_attempts,
+                retry_max_tokens,
+            )
+            try:
+                return self.caption(
+                    image_path,
+                    max_tokens=retry_max_tokens,
+                    temperature=0.0,
+                    require_complete=True,
+                )
+            except Exception as exc:
+                last_error = exc
+
+        logger.error(
+            "Caption request failed for %s after %s retries: %s",
+            Path(image_path).name,
+            self.config.retry_attempts,
+            last_error,
+        )
+        return f"[Error captioning frame: {last_error}]"
+
     def caption_batch(self, image_paths: list[str]) -> list[str]:
-        """Submit concurrent oMLX requests and preserve input order."""
+        """Submit isolated concurrent requests and preserve input order."""
         if not image_paths:
             return []
         max_workers = max(1, min(self.config.batch_size, len(image_paths)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(self.caption, image_paths))
+            return list(pool.map(self._caption_with_retry, image_paths))
 
 
 # ── Ollama Backend ──────────────────────────────────────────────────────────
@@ -99,7 +149,7 @@ class OllamaCaptioner:
     def caption_batch(self, image_paths: list[str]) -> list[str]:
         """Sequential fallback: Ollama has no batch API, so we loop.
 
-        Exists for call-site uniformity with OMLXCaptioner.caption_batch.
+        Exists for call-site uniformity with OpenAICompatibleCaptioner.
         """
         return [self.caption(p) for p in image_paths]
 
@@ -108,8 +158,8 @@ class OllamaCaptioner:
 
 def _get_captioner(config: CaptioningConfig):
     """Return the appropriate captioner backend."""
-    if config.backend == CaptionBackend.omlx:
-        return OMLXCaptioner(config)
+    if config.backend in (CaptionBackend.vllm, CaptionBackend.omlx):
+        return OpenAICompatibleCaptioner(config)
 
     return OllamaCaptioner(config)
 
@@ -123,8 +173,8 @@ def caption_frames(
     Generate captions for all extracted frames.
 
     Drives the captioner via ``caption_batch`` in chunks of ``config.batch_size``.
-    For oMLX each chunk becomes concurrent OpenAI-compatible requests handled
-    by the server scheduler. For Ollama it falls back to sequential per-image calls.
+    For vLLM/oMLX each chunk becomes concurrent OpenAI-compatible requests.
+    For Ollama it falls back to sequential per-image calls.
 
     Adds a 'caption' field to each frame metadata dict.
     Optionally saves per-frame and combined caption JSON files to output_dir.
@@ -137,8 +187,8 @@ def caption_frames(
 
     captioner = _get_captioner(config)
     backend_name = config.backend.value
-    if config.backend == CaptionBackend.omlx:
-        model_name = resolve_omlx_model(config).split("/")[-1]
+    if config.backend in (CaptionBackend.vllm, CaptionBackend.omlx):
+        model_name = resolve_inference_model(config).split("/")[-1]
     else:
         model_name = config.ollama_model
 
@@ -189,3 +239,8 @@ def caption_frames(
             json.dump(results, f, indent=2)
 
     return results
+
+
+# Compatibility names retained for callers from oMLX-only releases.
+OMLXCaptioner = OpenAICompatibleCaptioner
+VLLMCaptioner = OpenAICompatibleCaptioner
