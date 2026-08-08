@@ -367,7 +367,11 @@ def resolve_role_api_key(config: Any, *preferred_names: str) -> str | None:
 # checkpoints, because a vision model is wasted on text reasoning and a text
 # model cannot see frames at all.
 RECOMMENDED_OCR_MODEL = "Qwen3.6-27B-bf16"
-RECOMMENDED_TEXT_MODEL = "DeepSeek-V4-Flash-0731-MLX"
+# Qwen3.6 serves the text role too. A dedicated text model is welcome here, but
+# it must survive ScreenLens's actual inputs: captions are markdown with
+# indented list items, and DeepSeek-V4-Flash under oMLX emits its BOS token to
+# the token limit on exactly that shape (see degenerate_repetition).
+RECOMMENDED_TEXT_MODEL = "Qwen3.6-27B-bf16"
 
 
 def resolve_ocr_model(config) -> str:
