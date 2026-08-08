@@ -1,0 +1,1231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SCREENLENS // Video Scene Intelligence</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<style>
+:root {
+  --bg: #04060c;
+  --panel: rgba(13, 20, 34, 0.72);
+  --panel-solid: #0d1422;
+  --line: rgba(94, 234, 212, 0.10);
+  --line-strong: rgba(94, 234, 212, 0.22);
+  --txt: #d7e3f4;
+  --dim: #8493aa;
+  --faint: #77869e;
+  --cyan: #22d3ee;
+  --teal: #5eead4;
+  --amber: #fbbf24;
+  --red: #f87171;
+  --green: #34d399;
+  --violet: #a78bfa;
+  --mono: "SF Mono", ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  --sans: -apple-system, "Segoe UI", Inter, Roboto, "Helvetica Neue", sans-serif;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--txt); font-family: var(--sans);
+  font-size: 14px; overflow-x: hidden; min-height: 100vh;
+}
+::selection { background: rgba(34, 211, 238, 0.3); }
+::-webkit-scrollbar { width: 9px; height: 9px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: #1c2a42; border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-thumb:hover { background: #2b3f61; }
+
+#bg-canvas { position: fixed; inset: 0; z-index: 0; pointer-events: none; }
+#spotlight {
+  position: fixed; inset: 0; z-index: 1; pointer-events: none;
+  background: radial-gradient(600px circle at var(--mx, 50%) var(--my, 30%), rgba(34, 211, 238, 0.055), transparent 65%);
+}
+#grain {
+  position: fixed; inset: 0; z-index: 2; pointer-events: none; opacity: 0.5;
+  background:
+    repeating-linear-gradient(0deg, rgba(255,255,255,0.012) 0 1px, transparent 1px 3px),
+    radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.5) 100%);
+}
+
+#boot {
+  position: fixed; inset: 0; z-index: 100; background: var(--bg);
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 22px; transition: opacity 0.7s ease, visibility 0.7s;
+}
+#boot.done { opacity: 0; visibility: hidden; }
+.boot-logo {
+  font-family: var(--mono); font-size: 13px; letter-spacing: 0.55em; color: var(--cyan);
+  text-transform: uppercase; text-shadow: 0 0 24px rgba(34,211,238,0.6);
+  animation: bootPulse 1.6s ease-in-out infinite;
+}
+@keyframes bootPulse { 50% { opacity: 0.55; } }
+.boot-bar { width: 260px; height: 2px; background: #12203a; overflow: hidden; border-radius: 2px; }
+.boot-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, var(--teal), var(--cyan)); box-shadow: 0 0 12px var(--cyan); transition: width 0.25s ease; }
+.boot-log { font-family: var(--mono); font-size: 10.5px; color: var(--dim); height: 15px; letter-spacing: 0.08em; }
+
+header.top {
+  position: sticky; top: 0; z-index: 50;
+  display: flex; align-items: center; gap: 14px;
+  padding: 0 26px; height: 62px;
+  background: rgba(4, 6, 12, 0.82); backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--line);
+}
+.logo-mark { width: 34px; height: 34px; flex: none; filter: drop-shadow(0 0 8px rgba(34,211,238,0.45)); }
+.brand { line-height: 1.15; }
+.brand b { font-family: var(--mono); font-size: 15px; letter-spacing: 0.34em; color: #fff; font-weight: 700; }
+.brand span { display: block; font-size: 9.5px; letter-spacing: 0.28em; color: var(--dim); text-transform: uppercase; }
+.top-spacer { flex: 1; }
+.badge {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+  padding: 5px 11px; border: 1px solid var(--line-strong); border-radius: 3px;
+  color: var(--teal); background: rgba(94, 234, 212, 0.05); white-space: nowrap;
+}
+.badge.warn { color: var(--amber); border-color: rgba(251,191,36,0.3); background: rgba(251,191,36,0.06); }
+.badge.bad { color: var(--red); border-color: rgba(248,113,113,0.3); background: rgba(248,113,113,0.06); }
+.badge.ok { color: var(--green); border-color: rgba(52,211,153,0.3); background: rgba(52,211,153,0.06); }
+.badge.violet { color: var(--violet); border-color: rgba(167,139,250,0.3); background: rgba(167,139,250,0.06); }
+.clock { font-family: var(--mono); font-size: 12px; color: var(--dim); letter-spacing: 0.12em; display: flex; align-items: center; gap: 8px; }
+.live-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--green); box-shadow: 0 0 9px var(--green); animation: bootPulse 2s infinite; }
+.live-dot.off { background: var(--dim); box-shadow: none; animation: none; }
+
+.layout { position: relative; z-index: 10; display: flex; min-height: calc(100vh - 62px); }
+nav.side {
+  width: 208px; flex: none; padding: 26px 14px;
+  border-right: 1px solid var(--line);
+  display: flex; flex-direction: column; gap: 4px;
+  position: sticky; top: 62px; height: calc(100vh - 62px);
+}
+.nav-label { font-family: var(--mono); font-size: 9px; letter-spacing: 0.3em; color: var(--faint); text-transform: uppercase; padding: 0 12px 10px; }
+.nav-btn {
+  display: flex; align-items: center; gap: 11px;
+  padding: 10px 12px; border: 1px solid transparent; border-radius: 6px;
+  background: none; color: var(--dim); font-family: var(--sans); font-size: 13px;
+  cursor: pointer; text-align: left; transition: all 0.18s ease;
+}
+.nav-btn svg { width: 16px; height: 16px; flex: none; opacity: 0.8; }
+.nav-btn:hover { color: var(--txt); background: rgba(94, 234, 212, 0.04); }
+.nav-btn.active {
+  color: var(--teal); background: rgba(94, 234, 212, 0.07);
+  border-color: var(--line-strong); box-shadow: inset 2px 0 0 var(--cyan), 0 0 22px rgba(34,211,238,0.07);
+}
+.nav-btn .count { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--faint); }
+.side-foot { margin-top: auto; font-family: var(--mono); font-size: 9px; color: var(--faint); letter-spacing: 0.14em; padding: 12px; line-height: 1.9; }
+
+main { flex: 1; padding: 28px 30px 60px; max-width: 1560px; }
+.view { display: none; }
+.view.active { display: block; animation: viewIn 0.45s cubic-bezier(0.22, 1, 0.36, 1); }
+@keyframes viewIn { from { opacity: 0; transform: translateY(14px); } }
+
+.view-head { margin-bottom: 22px; }
+.view-head h1 { font-family: var(--mono); font-size: 21px; letter-spacing: 0.12em; color: #fff; font-weight: 600; }
+.view-head h1 em { font-style: normal; color: var(--cyan); }
+.view-head p { color: var(--dim); font-size: 12.5px; margin-top: 5px; letter-spacing: 0.04em; }
+
+.panel {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+  backdrop-filter: blur(8px); padding: 18px 20px; position: relative; overflow: hidden;
+}
+.panel::before {
+  content: ""; position: absolute; top: 0; left: 0; right: 0; height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(94,234,212,0.35), transparent);
+}
+.panel-title {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.26em; text-transform: uppercase;
+  color: var(--dim); margin-bottom: 14px; display: flex; align-items: center; gap: 8px;
+}
+.panel-title::after { content: ""; flex: 1; height: 1px; background: var(--line); }
+.grid { display: grid; gap: 16px; }
+.g-6 { grid-template-columns: repeat(6, 1fr); }
+.g-4 { grid-template-columns: repeat(4, 1fr); }
+.g-3 { grid-template-columns: repeat(3, 1fr); }
+.g-2 { grid-template-columns: repeat(2, 1fr); }
+.g-1 { grid-template-columns: 1fr; }
+.g-23 { grid-template-columns: 2fr 1fr; }
+.mt { margin-top: 16px; }
+@media (max-width: 1100px) {
+  .g-6 { grid-template-columns: repeat(3, 1fr); }
+  .g-4, .g-3, .g-2, .g-23 { grid-template-columns: 1fr; }
+}
+@media (max-width: 760px) {
+  header.top { padding: 0 12px; gap: 10px; }
+  .brand b { font-size: 11px; letter-spacing: 0.18em; }
+  .brand span, header.top .badge { display: none; }
+  .layout { display: block; }
+  nav.side {
+    position: sticky; top: 62px; z-index: 45;
+    width: 100%; height: auto; padding: 7px 10px;
+    flex-direction: row; overflow-x: auto;
+    border-right: 0; border-bottom: 1px solid var(--line);
+    background: rgba(4, 6, 12, 0.94); backdrop-filter: blur(14px);
+  }
+  .nav-label, .side-foot { display: none; }
+  .nav-btn { flex: none; padding: 8px 10px; white-space: nowrap; }
+  main { padding: 20px 14px 48px; }
+}
+
+.kpi { padding: 16px 18px; }
+.kpi .k-label { font-family: var(--mono); font-size: 9px; letter-spacing: 0.22em; color: var(--dim); text-transform: uppercase; }
+.kpi .k-value { font-family: var(--mono); font-size: 27px; font-weight: 600; color: #fff; margin-top: 8px; letter-spacing: -0.02em; text-shadow: 0 0 26px rgba(34,211,238,0.25); }
+.kpi .k-sub { font-size: 10.5px; color: var(--faint); margin-top: 5px; font-family: var(--mono); }
+.kpi.accent .k-value { color: var(--cyan); }
+.kpi.warn .k-value { color: var(--amber); }
+
+.toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.search {
+  flex: 1; min-width: 220px; display: flex; align-items: center; gap: 9px;
+  background: var(--panel); border: 1px solid var(--line); border-radius: 7px; padding: 9px 14px;
+}
+.search:focus-within { border-color: var(--line-strong); box-shadow: 0 0 18px rgba(34,211,238,0.08); }
+.search input { flex: 1; background: none; border: none; outline: none; color: var(--txt); font-family: var(--mono); font-size: 12px; }
+.search input::placeholder { color: var(--faint); }
+select.input, input.input, textarea.input {
+  background: var(--panel-solid); border: 1px solid var(--line); border-radius: 7px;
+  color: var(--txt); font-family: var(--mono); font-size: 11px; padding: 9px 12px; outline: none;
+  width: 100%;
+}
+select.input:focus, input.input:focus { border-color: var(--line-strong); }
+label.rf-label {
+  display: block; font-family: var(--mono); font-size: 9px; letter-spacing: 0.22em;
+  color: var(--dim); text-transform: uppercase; margin-bottom: 7px;
+}
+.form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.form-grid .full { grid-column: 1 / -1; }
+@media (max-width: 700px) { .form-grid { grid-template-columns: 1fr; } }
+.hint { font-family: var(--mono); font-size: 9.5px; color: var(--faint); margin-top: 6px; line-height: 1.6; }
+
+table.data { width: 100%; border-collapse: collapse; font-size: 12px; }
+table.data th {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.2em; text-transform: uppercase;
+  color: var(--faint); text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line-strong);
+}
+table.data td { padding: 9px 12px; border-bottom: 1px solid rgba(94,234,212,0.05); color: var(--txt); }
+table.data tr { cursor: pointer; }
+table.data tr:hover td { background: rgba(94,234,212,0.03); }
+table.data tr.sel td { background: rgba(34,211,238,0.07); }
+table.data td.mono { font-family: var(--mono); font-size: 11px; }
+table.data td.dim { color: var(--dim); }
+.table-wrap { overflow-x: auto; }
+
+.status-pill { font-family: var(--mono); font-size: 9px; letter-spacing: 0.1em; padding: 3px 9px; border-radius: 20px; border: 1px solid; white-space: nowrap; }
+.st-done, .st-ok, .st-embedded { color: var(--green); border-color: rgba(52,211,153,0.35); background: rgba(52,211,153,0.07); }
+.st-failed, .st-error, .st-empty { color: var(--red); border-color: rgba(248,113,113,0.35); background: rgba(248,113,113,0.07); }
+.st-running, .st-captioned { color: var(--amber); border-color: rgba(251,191,36,0.35); background: rgba(251,191,36,0.07); }
+.st-frames, .st-transcribed, .st-pending { color: var(--dim); border-color: var(--line-strong); }
+
+.risk-row { display: flex; align-items: center; gap: 12px; padding: 9px 4px; border-bottom: 1px solid rgba(94,234,212,0.05); border-radius: 4px; cursor: pointer; }
+.risk-row:hover { background: rgba(94,234,212,0.05); }
+.risk-rank { font-family: var(--mono); font-size: 10px; color: var(--faint); width: 34px; flex: none; }
+.risk-name { flex: 1; font-size: 12.5px; color: var(--txt); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.risk-bar { width: 130px; height: 4px; background: #12203a; border-radius: 2px; overflow: hidden; flex: none; }
+.risk-bar i { display: block; height: 100%; border-radius: 2px; background: linear-gradient(90deg, var(--teal), var(--cyan)); }
+.risk-score { font-family: var(--mono); font-size: 11px; width: 96px; text-align: right; flex: none; color: var(--dim); }
+
+.tag {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+  padding: 3px 9px; border-radius: 3px; border: 1px solid var(--line-strong); color: var(--teal); white-space: nowrap;
+}
+.tag.violet { color: var(--violet); border-color: rgba(167,139,250,0.35); }
+.tag.amber { color: var(--amber); border-color: rgba(251,191,36,0.35); }
+.tag.red { color: var(--red); border-color: rgba(248,113,113,0.35); }
+.chips { display: flex; gap: 7px; flex-wrap: wrap; }
+
+.btn {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em;
+  padding: 10px 22px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--line-strong); transition: all 0.15s; white-space: nowrap;
+  background: none; color: var(--dim);
+}
+.btn.primary { background: var(--cyan); color: #04121a; border-color: var(--cyan); font-weight: 700; }
+.btn.primary:hover { box-shadow: 0 0 22px rgba(34,211,238,0.45); }
+.btn.primary:disabled { opacity: 0.35; cursor: not-allowed; box-shadow: none; }
+.btn.ghost:hover { color: var(--txt); border-color: var(--cyan); }
+.btn.small { padding: 7px 14px; font-size: 10px; letter-spacing: 0.12em; }
+
+.control-bar { display: flex; align-items: center; justify-content: space-between; gap: 18px; flex-wrap: wrap; }
+.ctl-status { font-family: var(--mono); font-size: 11px; color: var(--dim); letter-spacing: 0.04em; }
+.phase-name { font-family: var(--mono); font-size: 14px; color: #fff; letter-spacing: 0.1em; }
+.phase-desc { color: var(--dim); font-size: 11.5px; line-height: 1.6; margin-top: 8px; }
+.phase-foot { display: flex; align-items: center; gap: 10px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }
+.req-tag { font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.18em; color: var(--violet); }
+
+.event-log { font-family: var(--mono); font-size: 11px; line-height: 1.7; color: var(--dim); max-height: 340px; overflow-y: auto; }
+.event-log .ev { padding: 4px 0; border-bottom: 1px solid rgba(94,234,212,0.04); word-break: break-word; }
+.event-log .ev b { color: var(--cyan); font-weight: 600; margin-right: 8px; }
+.event-log .ev .t { color: var(--faint); margin-right: 10px; }
+.event-log .ev.error { color: var(--red); }
+.event-log .ev.stage b { color: var(--teal); }
+
+.stage-track { display: flex; gap: 8px; flex-wrap: wrap; }
+.stage-pill { flex: 1; min-width: 108px; padding: 12px 14px; border-radius: 8px; border: 1px solid var(--line); background: rgba(94,234,212,0.03); }
+.stage-pill .sn { font-family: var(--mono); font-size: 10px; letter-spacing: 0.16em; color: var(--dim); text-transform: uppercase; }
+.stage-pill .sv { font-family: var(--mono); font-size: 22px; color: #fff; margin-top: 6px; }
+.stage-pill.active { border-color: var(--cyan); box-shadow: 0 0 18px rgba(34,211,238,0.12); }
+
+.frame-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 12px; }
+.frame-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden;
+  cursor: pointer; transition: transform 0.18s, border-color 0.18s, box-shadow 0.18s;
+}
+.frame-card:hover { transform: translateY(-3px); border-color: var(--line-strong); box-shadow: 0 12px 34px rgba(0,0,0,0.5); }
+.frame-card img { display: block; width: 100%; height: 112px; object-fit: cover; background: #0a101d; }
+.frame-card .fc-meta { padding: 7px 10px; font-family: var(--mono); font-size: 9.5px; color: var(--faint); display: flex; justify-content: space-between; gap: 6px; }
+.frame-card .fc-meta b { color: var(--teal); font-weight: 500; }
+
+.result-card { background: var(--panel); border: 1px solid var(--line); border-radius: 9px; padding: 14px 16px; margin-bottom: 12px; }
+.result-card .rc-head { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+.result-card .rc-body { font-size: 12.5px; color: var(--dim); line-height: 1.65; white-space: pre-wrap; max-height: 220px; overflow-y: auto; }
+
+pre.doc {
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.65; color: var(--txt);
+  white-space: pre-wrap; word-break: break-word; max-height: 620px; overflow-y: auto;
+  background: #080d18; border: 1px solid var(--line); border-radius: 8px; padding: 16px 18px;
+}
+
+#modal-overlay {
+  position: fixed; inset: 0; z-index: 80; background: rgba(2, 4, 9, 0.78);
+  backdrop-filter: blur(6px); display: none; align-items: flex-start; justify-content: center;
+  overflow-y: auto; padding: 46px 20px;
+}
+#modal-overlay.open { display: flex; animation: fadeIn 0.25s ease; }
+@keyframes fadeIn { from { opacity: 0; } }
+.modal {
+  width: 900px; max-width: 100%; background: #0a101d; border: 1px solid var(--line-strong);
+  border-radius: 14px; padding: 30px 34px; position: relative;
+  box-shadow: 0 30px 90px rgba(0,0,0,0.7), 0 0 50px rgba(34,211,238,0.05);
+}
+.modal-close {
+  position: absolute; top: 16px; right: 16px; width: 32px; height: 32px;
+  background: none; border: 1px solid var(--line); border-radius: 6px; color: var(--dim);
+  font-size: 15px; cursor: pointer; font-family: var(--mono);
+}
+.modal-close:hover { color: var(--red); border-color: rgba(248,113,113,0.4); }
+.modal h2 { font-size: 20px; color: #fff; margin: 0 34px 6px 0; }
+.modal img.frame-full { width: 100%; border-radius: 8px; border: 1px solid var(--line); margin: 16px 0; }
+.m-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 18px 0; }
+.m-field { background: rgba(94,234,212,0.03); border: 1px solid var(--line); border-radius: 7px; padding: 10px 13px; }
+.m-field .f-label { font-family: var(--mono); font-size: 8.5px; letter-spacing: 0.2em; color: var(--faint); text-transform: uppercase; }
+.m-field .f-value { font-size: 12.5px; color: var(--txt); margin-top: 5px; line-height: 1.5; word-break: break-word; }
+.m-section { margin-top: 18px; }
+.m-section .s-label { font-family: var(--mono); font-size: 9.5px; letter-spacing: 0.26em; color: var(--cyan); text-transform: uppercase; margin-bottom: 8px; }
+.m-section .s-body { font-size: 12.5px; color: var(--txt); line-height: 1.7; opacity: 0.9; white-space: pre-wrap; }
+
+.empty { text-align: center; padding: 54px 20px; color: var(--faint); font-family: var(--mono); font-size: 11px; letter-spacing: 0.18em; }
+.foot-note { margin-top: 40px; text-align: center; font-family: var(--mono); font-size: 9px; color: var(--faint); letter-spacing: 0.24em; text-transform: uppercase; }
+.live-line {
+  font-family: var(--mono); font-size: 12px; color: var(--teal); letter-spacing: 0.04em;
+  padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px;
+  background: rgba(34,211,238,0.04); word-break: break-word;
+}
+.spinner { display: inline-block; width: 9px; height: 9px; border: 2px solid rgba(251,191,36,0.25); border-top-color: var(--amber); border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: -1px; margin-right: 5px; }
+@keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<canvas id="bg-canvas"></canvas>
+<div id="spotlight"></div>
+<div id="grain"></div>
+
+<div id="boot">
+  <div class="boot-logo">SCREENLENS</div>
+  <div class="boot-bar"><i id="boot-fill"></i></div>
+  <div class="boot-log" id="boot-log">initialising command deck…</div>
+</div>
+
+<header class="top">
+  <svg class="logo-mark" viewBox="0 0 40 40" fill="none">
+    <circle cx="20" cy="20" r="13.5" stroke="#22d3ee" stroke-width="1.5"/>
+    <circle cx="20" cy="20" r="5.2" fill="rgba(94,234,212,0.10)" stroke="#5eead4" stroke-width="1.2"/>
+    <path d="M20 6.5 L27 14.5 M33.5 20 L23.2 20 M20 33.5 L13 25.5 M6.5 20 L16.8 20" stroke="#5eead4" stroke-width="1.1" stroke-linecap="round"/>
+  </svg>
+  <div class="brand">
+    <b>SCREENLENS</b>
+    <span>Local Video Scene Intelligence</span>
+  </div>
+  <div class="top-spacer"></div>
+  <div class="badge" id="badge-vision" title="Vision model — captions and OCR">—</div>
+  <div class="badge violet" id="badge-text" title="Text model — summaries, reconstruction, cleanup">—</div>
+  <div class="badge warn" id="badge-status">IDLE</div>
+  <div class="clock"><span class="live-dot off" id="live-dot"></span><span id="clock">--:--:--</span></div>
+</header>
+
+<div class="layout">
+  <nav class="side">
+    <div class="nav-label">Command Deck</div>
+    <button class="nav-btn active" data-view="overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg>
+      Overview
+    </button>
+    <button class="nav-btn" data-view="runs">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 6h16M4 12h16M4 18h16"/><circle cx="8" cy="6" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="11" cy="18" r="1.6"/></svg>
+      Runs <span class="count" id="nav-run-count"></span>
+    </button>
+    <button class="nav-btn" data-view="frames">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 9h18M8 5v14"/></svg>
+      Frames <span class="count" id="nav-frame-count"></span>
+    </button>
+    <button class="nav-btn" data-view="search">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></svg>
+      Search
+    </button>
+    <button class="nav-btn" data-view="pipeline">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="12" r="2.2"/><circle cx="19" cy="6" r="2.2"/><circle cx="19" cy="18" r="2.2"/><path d="M7 11 L17 6.5 M7 13 L17 17.5"/></svg>
+      Pipeline
+    </button>
+    <button class="nav-btn" data-view="artifacts">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M9 13h6M9 17h4"/></svg>
+      Artifacts <span class="count" id="nav-art-count"></span>
+    </button>
+    <button class="nav-btn" data-view="about">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="9"/><path d="M12 11 v5 M12 7.5 v.01"/></svg>
+      About
+    </button>
+    <div class="side-foot">
+      LANGGRAPH · 3 PIPELINES<br>
+      KEYFRAME · CLIP · CHROMA<br>
+      OMLX / VLLM<br>
+      LOCAL ONLY
+    </div>
+  </nav>
+
+  <main>
+    <!-- ── OVERVIEW ── -->
+    <section class="view active" id="view-overview">
+      <div class="view-head">
+        <h1>SITUATION <em>ROOM</em></h1>
+        <p>Live view across ingested runs, frames, captions and verbatim transcripts.</p>
+      </div>
+      <div class="grid g-6" id="kpis"></div>
+      <div class="grid g-1 mt">
+        <div class="live-line" id="live-line">⟳ no job running</div>
+      </div>
+      <div class="grid g-23 mt">
+        <div class="panel">
+          <div class="panel-title">Run Progress</div>
+          <div id="run-progress"><div class="empty">NO RUNS FOUND</div></div>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Stage Distribution</div>
+          <div class="stage-track" id="stage-track"></div>
+        </div>
+      </div>
+      <div class="grid g-1 mt">
+        <div class="panel">
+          <div class="panel-title">Live Activity</div>
+          <div class="event-log" id="event-log"><div class="empty">NO EVENTS YET</div></div>
+        </div>
+      </div>
+      <div class="foot-note">keyframes · captions · embeddings · verbatim ocr · local models only</div>
+    </section>
+
+    <!-- ── RUNS ── -->
+    <section class="view" id="view-runs">
+      <div class="view-head">
+        <h1>RUN <em>REGISTER</em></h1>
+        <p>Every folder under ./data/ — click a row to select it for frames, search and artifacts.</p>
+      </div>
+      <div class="toolbar">
+        <div class="search"><input id="run-search" placeholder="Filter runs…" /></div>
+        <button class="btn ghost small" id="refresh-runs">↻ REFRESH</button>
+      </div>
+      <div class="panel">
+        <div class="table-wrap">
+          <table class="data">
+            <thead>
+              <tr><th>Run</th><th>Stage</th><th>Frames</th><th>Captions</th><th>OCR</th><th>Artifacts</th><th>Vector DB</th><th>Modified</th></tr>
+            </thead>
+            <tbody id="run-tbody"></tbody>
+          </table>
+        </div>
+        <div class="empty" id="run-empty" style="display:none">NO RUNS UNDER ./DATA/</div>
+      </div>
+    </section>
+
+    <!-- ── FRAMES ── -->
+    <section class="view" id="view-frames">
+      <div class="view-head">
+        <h1>FRAME <em>GALLERY</em></h1>
+        <p>Extracted keyframes for the selected run. Click a frame to read its caption.</p>
+      </div>
+      <div class="toolbar">
+        <div class="ctl-status" id="frames-run">no run selected</div>
+        <div class="top-spacer"></div>
+        <button class="btn ghost small" id="frames-reload">↻ RELOAD</button>
+      </div>
+      <div class="frame-grid" id="frame-grid"></div>
+      <div class="empty" id="frames-empty">SELECT A RUN IN THE REGISTER</div>
+    </section>
+
+    <!-- ── SEARCH ── -->
+    <section class="view" id="view-search">
+      <div class="view-head">
+        <h1>SEMANTIC <em>SEARCH</em></h1>
+        <p>CLIP + ChromaDB over the selected run's frames, with an optional LLM answer.</p>
+      </div>
+      <div class="panel">
+        <div class="form-grid">
+          <div class="full">
+            <label class="rf-label">Question</label>
+            <input class="input" id="q-query" placeholder="What application is being demonstrated?" />
+          </div>
+          <div>
+            <label class="rf-label">Run</label>
+            <select class="input" id="q-run"></select>
+          </div>
+          <div>
+            <label class="rf-label">Top K</label>
+            <input class="input" id="q-topk" type="number" min="1" max="50" value="10" />
+          </div>
+          <div class="full">
+            <label class="rf-label" style="display:flex;align-items:center;gap:10px;text-transform:none;letter-spacing:0.04em">
+              <input type="checkbox" id="q-summarize" style="width:auto" checked />
+              Synthesize an answer with the text model (DeepSeek) instead of returning raw hits only.
+            </label>
+          </div>
+        </div>
+        <div class="control-bar mt">
+          <div class="ctl-status" id="q-status">idle</div>
+          <button class="btn primary" id="q-btn">▶ SEARCH</button>
+        </div>
+      </div>
+      <div class="panel mt" id="q-summary-panel" style="display:none">
+        <div class="panel-title">Answer</div>
+        <div class="m-section"><div class="s-body" id="q-summary"></div></div>
+      </div>
+      <div class="mt" id="q-results"></div>
+    </section>
+
+    <!-- ── PIPELINE ── -->
+    <section class="view" id="view-pipeline">
+      <div class="view-head">
+        <h1>PIPELINE <em>CONTROL</em></h1>
+        <p>Start any ScreenLens pipeline. One job at a time — they share the model server and the CLIP device.</p>
+      </div>
+      <div class="panel">
+        <div class="control-bar">
+          <div class="ctl-status" id="backend-status">● checking endpoint…</div>
+          <button class="btn primary" id="run-btn">▶ RUN PIPELINE</button>
+        </div>
+        <div class="form-grid mt" style="margin-top:18px">
+          <div>
+            <label class="rf-label">Pipeline</label>
+            <select class="input" id="f-pipeline">
+              <option value="ingest" selected>ingest — keyframes → captions → embeddings</option>
+              <option value="transcribe">transcribe — verbatim OCR → stitched transcript</option>
+              <option value="summarize">summarize — full-video summary from captions</option>
+              <option value="reconstruct">reconstruct — rebuild files/docs from captions</option>
+              <option value="assemble">assemble — merge every run into a corpus</option>
+            </select>
+          </div>
+          <div>
+            <label class="rf-label">Backend</label>
+            <select class="input" id="f-backend">
+              <option value="omlx" selected>omlx</option>
+              <option value="vllm">vllm</option>
+              <option value="ollama">ollama (captions only)</option>
+            </select>
+          </div>
+          <div class="full" data-need="video">
+            <label class="rf-label">Video</label>
+            <select class="input" id="f-video-pick" style="margin-bottom:8px"></select>
+            <input class="input" id="f-video" placeholder="/path/to/recording.mov" />
+            <div class="hint">Picker lists ./input — type any path to use a file elsewhere.</div>
+          </div>
+          <div data-need="run">
+            <label class="rf-label">Run folder</label>
+            <select class="input" id="f-run"></select>
+          </div>
+          <div data-need="ingest">
+            <label class="rf-label">Extraction strategy</label>
+            <select class="input" id="f-strategy">
+              <option value="keyframe" selected>keyframe (hybrid change detection)</option>
+              <option value="fixed_fps">fixed_fps</option>
+            </select>
+          </div>
+          <div data-need="ingest">
+            <label class="rf-label">FPS (fixed_fps only)</label>
+            <input class="input" id="f-fps" type="number" step="0.1" value="1.0" />
+          </div>
+          <div data-need="transcribe">
+            <label class="rf-label">Sample FPS</label>
+            <input class="input" id="f-samplefps" type="number" step="0.5" value="2.0" />
+          </div>
+          <div>
+            <label class="rf-label">Vision model (captions / OCR)</label>
+            <select class="input" id="f-vision"></select>
+          </div>
+          <div>
+            <label class="rf-label">Text model (summary / reconstruct / cleanup)</label>
+            <select class="input" id="f-text"></select>
+          </div>
+          <div class="full">
+            <label class="rf-label">Endpoint base URL</label>
+            <input class="input" id="f-baseurl" placeholder="http://127.0.0.1:8000/v1" />
+          </div>
+          <div class="full" data-need="transcribe">
+            <label class="rf-label" style="display:flex;align-items:center;gap:10px;text-transform:none;letter-spacing:0.04em">
+              <input type="checkbox" id="f-cleanup" style="width:auto" />
+              Run the optional LLM seam/indent cleanup pass. Off by default — the raw stitched OCR is already verbatim.
+            </label>
+            <label class="rf-label" style="display:flex;align-items:center;gap:10px;text-transform:none;letter-spacing:0.04em;margin-top:8px">
+              <input type="checkbox" id="f-deterministic" style="width:auto" />
+              Apple Vision cross-check (macOS, needs ocrmac).
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <div class="grid g-3 mt">
+        <div class="panel">
+          <div class="phase-name">INGEST</div>
+          <div class="phase-desc">Hybrid keyframe detection (SSIM + pHash + HSV), dense captions, OpenCLIP embeddings into a per-video ChromaDB.</div>
+          <div class="phase-foot"><span class="req-tag">VISION MODEL · GRAPH</span></div>
+        </div>
+        <div class="panel">
+          <div class="phase-name">TRANSCRIBE</div>
+          <div class="phase-desc">Dense frame sampling, verbatim OCR, then scroll-overlap dedup in text space. Cleanup is opt-in.</div>
+          <div class="phase-foot"><span class="req-tag">VISION MODEL · LINEAR</span></div>
+        </div>
+        <div class="panel">
+          <div class="phase-name">RECONSTRUCT</div>
+          <div class="phase-desc">classify → plan → workers → QA reflect → save, looping up to 3 times on QA failure.</div>
+          <div class="phase-foot"><span class="req-tag">TEXT MODEL · GRAPH</span></div>
+        </div>
+      </div>
+
+      <div class="panel mt">
+        <div class="panel-title">Job History</div>
+        <div class="table-wrap">
+          <table class="data">
+            <thead><tr><th>Job</th><th>Pipeline</th><th>Status</th><th>Started</th><th>Elapsed</th><th>Detail</th></tr></thead>
+            <tbody id="job-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── ARTIFACTS ── -->
+    <section class="view" id="view-artifacts">
+      <div class="view-head">
+        <h1>OUTPUT <em>ARTIFACTS</em></h1>
+        <p>Transcripts, reconstructed files and summaries written under the selected run's output/.</p>
+      </div>
+      <div class="toolbar">
+        <div class="ctl-status" id="art-run">no run selected</div>
+        <div class="top-spacer"></div>
+        <button class="btn ghost small" id="art-reload">↻ RELOAD</button>
+      </div>
+      <div class="chips" id="art-chips" style="margin-bottom:16px"></div>
+      <div class="panel">
+        <div class="panel-title" id="art-title">No artifact opened</div>
+        <pre class="doc" id="art-body">Select a run in the register, then pick an artifact above.</pre>
+      </div>
+    </section>
+
+    <!-- ── ABOUT ── -->
+    <section class="view" id="view-about">
+      <div class="view-head">
+        <h1>ABOUT <em>SCREENLENS</em></h1>
+        <p>Local video scene intelligence for NVIDIA DGX Spark and Apple Silicon.</p>
+      </div>
+      <div class="grid g-2">
+        <div class="panel">
+          <div class="panel-title">What it does</div>
+          <p style="color:var(--dim);line-height:1.7;font-size:13px">
+            Ingests screen recordings, extracts keyframes, captions them with a
+            vision-language model, embeds them with OpenCLIP and answers
+            natural-language questions from ChromaDB. A second pipeline rebuilds
+            the visible files and documents; a third transcribes them
+            character-for-character and stitches scroll overlap in text space.
+          </p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Model roles</div>
+          <p style="color:var(--dim);line-height:1.7;font-size:13px">
+            Two roles against one OpenAI-compatible endpoint. The
+            <b style="color:var(--teal)">vision</b> model reads frames
+            (captions, OCR) and must be vision-capable. The
+            <b style="color:var(--violet)">text</b> model does the reasoning
+            (summaries, reconstruction plan/QA, transcript cleanup) and never
+            sees an image. On DGX Spark both resolve to the single served vLLM
+            checkpoint.
+          </p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">Stack</div>
+          <p style="color:var(--dim);line-height:1.7;font-size:13px;font-family:var(--mono)">
+            LangGraph StateGraph × 2 + linear transcribe<br>
+            OpenCLIP ViT-B-32 · ChromaDB · OpenCV<br>
+            oMLX / vLLM OpenAI-compatible client<br>
+            Command deck UI · stdlib HTTP, no build step
+          </p>
+        </div>
+        <div class="panel">
+          <div class="panel-title">CLI</div>
+          <p style="color:var(--dim);line-height:1.7;font-size:12px;font-family:var(--mono)">
+            python -m src.cli serve<br>
+            python -m src.cli ingest video.mov<br>
+            python -m src.cli transcribe code.mov<br>
+            python -m src.cli search "what is shown?"<br>
+            python -m src.cli reconstruct
+          </p>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="modal-overlay">
+  <div class="modal">
+    <button class="modal-close" id="modal-close">×</button>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+
+const STAGE_PROGRESS = {empty:0, frames:30, transcribed:70, captioned:70, embedded:100};
+const NEEDS = {
+  ingest:      {video:true,  run:false, ingest:true,  transcribe:false},
+  transcribe:  {video:true,  run:false, ingest:false, transcribe:true},
+  summarize:   {video:false, run:true,  ingest:false, transcribe:false},
+  reconstruct: {video:false, run:true,  ingest:false, transcribe:false},
+  assemble:    {video:false, run:false, ingest:false, transcribe:false},
+};
+
+let RUNS = [];
+let SELECTED = null;      // slug
+let SNAPSHOT = null;      // detailed snapshot of SELECTED
+let BUSY = false;
+let MODELS = {all: [], vision: [], text: []};
+
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function fmtNum(n) {
+  n = Number(n) || 0;
+  return n < 1000 ? String(n) : (n/1000).toFixed(1) + "k";
+}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + " B";
+  if (n < 1048576) return (n/1024).toFixed(0) + " KB";
+  return (n/1048576).toFixed(1) + " MB";
+}
+function fmtTime(epoch) {
+  if (!epoch) return "—";
+  return new Date(epoch * 1000).toISOString().replace("T", " ").slice(0, 16);
+}
+
+/* ── boot ── */
+(function boot() {
+  const fill = $("#boot-fill"), log = $("#boot-log");
+  const steps = [[18,"loading static shell…"],[42,"binding command deck…"],[68,"probing endpoint…"],[88,"scanning ./data…"],[100,"ready"]];
+  let i = 0;
+  const t = setInterval(() => {
+    if (i >= steps.length) { clearInterval(t); setTimeout(() => $("#boot").classList.add("done"), 250); return; }
+    fill.style.width = steps[i][0] + "%";
+    log.textContent = steps[i][1];
+    i++;
+  }, 180);
+})();
+
+/* ── ambient ── */
+(function ambient() {
+  const c = $("#bg-canvas"), ctx = c.getContext("2d");
+  let w, h, dots = [];
+  function resize() {
+    w = c.width = innerWidth; h = c.height = innerHeight;
+    dots = Array.from({length: 48}, () => ({
+      x: Math.random()*w, y: Math.random()*h,
+      r: Math.random()*1.4+0.3, v: Math.random()*0.15+0.02
+    }));
+  }
+  resize(); addEventListener("resize", resize);
+  addEventListener("pointermove", e => {
+    document.documentElement.style.setProperty("--mx", e.clientX + "px");
+    document.documentElement.style.setProperty("--my", e.clientY + "px");
+  });
+  (function frame() {
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = "rgba(94,234,212,0.35)";
+    for (const d of dots) {
+      d.y -= d.v; if (d.y < 0) d.y = h;
+      ctx.beginPath(); ctx.arc(d.x, d.y, d.r, 0, Math.PI*2); ctx.fill();
+    }
+    requestAnimationFrame(frame);
+  })();
+})();
+
+function tickClock() { $("#clock").textContent = new Date().toTimeString().slice(0,8); }
+setInterval(tickClock, 1000); tickClock();
+
+/* ── nav ── */
+function go(name) {
+  $$(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.view === name));
+  $$(".view").forEach(v => v.classList.toggle("active", v.id === "view-" + name));
+  location.hash = name;
+}
+$$(".nav-btn").forEach(b => b.addEventListener("click", () => go(b.dataset.view)));
+
+/* ── API ── */
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+function post(path, body) {
+  return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+}
+
+/* ── models + roles ── */
+async function loadRoles() {
+  try {
+    const roles = await api("/api/roles");
+    const v = roles.caption || {}, t = roles.text || {};
+    const vb = $("#badge-vision");
+    vb.textContent = "◉ " + (v.model || "—");
+    vb.className = "badge" + (v.vision_ok === false ? " bad" : "");
+    vb.title = `Vision role — ${v.provider} @ ${v.base_url}` +
+      (v.vision_ok === false ? " — NOT vision-capable, captions/OCR will fail" : "");
+    $("#badge-text").textContent = "▤ " + (t.model || "—");
+    $("#badge-text").title = `Text role — ${t.provider} @ ${t.base_url}`;
+    if (!$("#f-baseurl").value) $("#f-baseurl").value = v.base_url || "";
+    return roles;
+  } catch (e) { return null; }
+}
+
+async function loadBackend() {
+  try {
+    const d = await api("/api/backend");
+    const el = $("#backend-status");
+    if (d.reachable) {
+      MODELS = {all: d.models || [], vision: d.vision_models || [], text: d.text_models || []};
+      el.innerHTML = `<span style="color:var(--green)">●</span> ${esc(d.provider)} reachable at ${esc(d.base_url)} — ${MODELS.all.length} model(s)`;
+      fillModelSelects();
+    } else {
+      el.innerHTML = `<span style="color:var(--amber)">●</span> ${esc(d.provider)} offline at ${esc(d.base_url)}${d.detail ? " — " + esc(d.detail) : ""}`;
+    }
+  } catch (e) {
+    $("#backend-status").textContent = "endpoint probe failed";
+  }
+}
+
+async function fillModelSelects() {
+  const roles = await loadRoles();
+  const opt = (list, current, note) => {
+    const seen = new Set();
+    const items = [];
+    if (current && !list.includes(current)) items.push([current, current + " (configured)"]);
+    for (const m of list) if (!seen.has(m)) { seen.add(m); items.push([m, m + note(m)]); }
+    return items.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join("");
+  };
+  const vision = $("#f-vision"), text = $("#f-text");
+  const curV = roles?.caption?.model, curT = roles?.text?.model;
+  // Vision role: only offer models that can actually see. The capability guard
+  // aborts on a text-only pick anyway, so don't let the UI suggest one.
+  vision.innerHTML = opt(MODELS.vision, curV, () => " (vision)");
+  text.innerHTML = opt(MODELS.all, curT, m => MODELS.vision.includes(m) ? " (vision)" : " (text)");
+  if (curV) vision.value = curV;
+  if (curT) text.value = curT;
+}
+
+/* ── runs ── */
+async function loadRuns() {
+  const d = await api("/api/runs");
+  RUNS = d.runs || [];
+  $("#nav-run-count").textContent = RUNS.length || "";
+  renderRunTable();
+  renderRunProgress();
+  renderStageTrack();
+  fillRunSelects();
+  if (!SELECTED && RUNS.length) selectRun(RUNS[0].slug, false);
+  return d;
+}
+
+function fillRunSelects() {
+  const html = RUNS.map(r =>
+    `<option value="${esc(r.slug)}">${esc(r.slug)} — ${r.frames} frames, ${r.captions} captions</option>`
+  ).join("");
+  for (const sel of [$("#q-run"), $("#f-run")]) {
+    const keep = sel.value;
+    sel.innerHTML = html || `<option value="">no runs found</option>`;
+    if (keep && RUNS.some(r => r.slug === keep)) sel.value = keep;
+    else if (SELECTED) sel.value = SELECTED;
+  }
+}
+
+function renderRunTable(filter="") {
+  const q = filter.trim().toLowerCase();
+  const rows = RUNS.filter(r => !q || r.slug.toLowerCase().includes(q) || r.stage.includes(q));
+  const tb = $("#run-tbody");
+  $("#run-empty").style.display = rows.length ? "none" : "block";
+  tb.innerHTML = rows.map(r => `
+    <tr data-slug="${esc(r.slug)}" class="${r.slug === SELECTED ? "sel" : ""}">
+      <td class="mono">${esc(r.slug)}</td>
+      <td><span class="status-pill st-${esc(r.stage)}">${esc(r.stage)}</span></td>
+      <td class="mono">${r.frames}</td>
+      <td class="mono">${r.captions}</td>
+      <td class="mono">${r.ocr}</td>
+      <td class="mono">${r.outputs.length}</td>
+      <td class="mono dim">${r.has_chromadb ? "yes" : "—"}</td>
+      <td class="mono dim">${fmtTime(r.modified)}</td>
+    </tr>`).join("");
+  tb.querySelectorAll("tr").forEach(tr =>
+    tr.addEventListener("click", () => selectRun(tr.dataset.slug, true)));
+}
+
+function renderRunProgress() {
+  const box = $("#run-progress");
+  if (!RUNS.length) { box.innerHTML = `<div class="empty">NO RUNS FOUND</div>`; return; }
+  box.innerHTML = RUNS.slice(0, 12).map(r => {
+    const pct = STAGE_PROGRESS[r.stage] ?? 0;
+    return `<div class="risk-row" data-slug="${esc(r.slug)}">
+      <div class="risk-rank">${r.frames}f</div>
+      <div class="risk-name">${esc(r.slug)}</div>
+      <div class="risk-bar"><i style="width:${pct}%"></i></div>
+      <div class="risk-score">${esc(r.stage)}</div>
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".risk-row").forEach(row =>
+    row.addEventListener("click", () => { selectRun(row.dataset.slug, true); go("runs"); }));
+}
+
+function renderStageTrack() {
+  const counts = {};
+  for (const r of RUNS) counts[r.stage] = (counts[r.stage] || 0) + 1;
+  const stages = ["frames","captioned","embedded","transcribed","empty"];
+  $("#stage-track").innerHTML = stages.map(s =>
+    `<div class="stage-pill ${counts[s] ? "active" : ""}"><div class="sn">${s}</div><div class="sv">${counts[s] || 0}</div></div>`
+  ).join("");
+}
+
+function renderKPIs() {
+  const totals = RUNS.reduce((a, r) => ({
+    frames: a.frames + r.frames, captions: a.captions + r.captions,
+    ocr: a.ocr + r.ocr, outputs: a.outputs + r.outputs.length,
+    vector: a.vector + (r.has_chromadb ? 1 : 0),
+  }), {frames:0, captions:0, ocr:0, outputs:0, vector:0});
+
+  const cards = [
+    {label:"Runs", value:String(RUNS.length), sub:`under ./data/`, cls:"accent"},
+    {label:"Frames", value:fmtNum(totals.frames), sub:"extracted keyframes", cls:""},
+    {label:"Captions", value:fmtNum(totals.captions), sub:"vision-model reads", cls:"accent"},
+    {label:"OCR frames", value:fmtNum(totals.ocr), sub:"verbatim transcriptions", cls:""},
+    {label:"Artifacts", value:String(totals.outputs), sub:"files in output/", cls:""},
+    {label:"Vector DBs", value:String(totals.vector), sub:"searchable collections", cls: totals.vector ? "accent" : "warn"},
+  ];
+  $("#kpis").innerHTML = cards.map(c => `
+    <div class="panel kpi ${c.cls}">
+      <div class="k-label">${c.label}</div>
+      <div class="k-value">${esc(c.value)}</div>
+      <div class="k-sub">${esc(c.sub)}</div>
+    </div>`).join("");
+}
+
+async function selectRun(slug, jump) {
+  if (!slug) return;
+  SELECTED = slug;
+  renderRunTable($("#run-search").value);
+  $("#frames-run").textContent = slug;
+  $("#art-run").textContent = slug;
+  for (const sel of [$("#q-run"), $("#f-run")]) if (RUNS.some(r => r.slug === slug)) sel.value = slug;
+  try {
+    SNAPSHOT = await api("/api/run?slug=" + encodeURIComponent(slug));
+  } catch (e) { SNAPSHOT = null; }
+  renderFrames();
+  renderArtifactChips();
+}
+
+/* ── frames ── */
+function renderFrames() {
+  const grid = $("#frame-grid"), empty = $("#frames-empty");
+  const frames = SNAPSHOT?.frames_list || [];
+  $("#nav-frame-count").textContent = frames.length || "";
+  if (!frames.length) {
+    grid.innerHTML = "";
+    empty.style.display = "block";
+    empty.textContent = SELECTED ? "THIS RUN HAS NO FRAMES" : "SELECT A RUN IN THE REGISTER";
+    return;
+  }
+  empty.style.display = "none";
+  const caps = new Map((SNAPSHOT?.captions_preview || []).map(c => [c.frame, c]));
+  grid.innerHTML = frames.map((f, i) => {
+    const cap = caps.get(f.name);
+    const src = `/api/frame/${encodeURIComponent(SELECTED)}/${encodeURIComponent(f.name)}`;
+    return `<div class="frame-card" data-i="${i}">
+      <img loading="lazy" src="${src}" alt="${esc(f.name)}">
+      <div class="fc-meta"><b>${esc(cap?.timestamp_str || f.name.replace(/\.\w+$/, ""))}</b><span>${cap ? cap.chars + " ch" : fmtBytes(f.size)}</span></div>
+    </div>`;
+  }).join("");
+  grid.querySelectorAll(".frame-card").forEach(card =>
+    card.addEventListener("click", () => openFrame(Number(card.dataset.i))));
+}
+
+function openFrame(i) {
+  const f = (SNAPSHOT?.frames_list || [])[i];
+  if (!f) return;
+  const cap = (SNAPSHOT?.captions_preview || []).find(c => c.frame === f.name);
+  const src = `/api/frame/${encodeURIComponent(SELECTED)}/${encodeURIComponent(f.name)}`;
+  $("#modal-body").innerHTML = `
+    <h2>${esc(f.name)}</h2>
+    <div class="chips" style="margin-top:10px">
+      <span class="tag">${esc(SELECTED)}</span>
+      ${cap?.timestamp_str ? `<span class="tag amber">${esc(cap.timestamp_str)}</span>` : ""}
+      <span class="tag violet">${fmtBytes(f.size)}</span>
+    </div>
+    <img class="frame-full" src="${src}" alt="${esc(f.name)}">
+    <div class="m-section"><div class="s-label">Caption${cap ? ` (${cap.chars} chars)` : ""}</div>
+      <div class="s-body">${cap ? esc(cap.preview) + (cap.chars > cap.preview.length ? "\n…" : "") : "No caption for this frame yet — run the ingest pipeline."}</div>
+    </div>`;
+  $("#modal-overlay").classList.add("open");
+}
+$("#modal-close").onclick = () => $("#modal-overlay").classList.remove("open");
+$("#modal-overlay").addEventListener("click", e => { if (e.target.id === "modal-overlay") e.currentTarget.classList.remove("open"); });
+
+/* ── artifacts ── */
+function renderArtifactChips() {
+  const outputs = SNAPSHOT?.outputs || [];
+  $("#nav-art-count").textContent = outputs.length || "";
+  const box = $("#art-chips");
+  if (!outputs.length) {
+    box.innerHTML = `<span class="tag red">no artifacts in output/</span>`;
+    $("#art-title").textContent = "No artifact opened";
+    $("#art-body").textContent = SELECTED
+      ? "This run has no output/ files yet. Run transcribe, reconstruct or summarize."
+      : "Select a run in the register, then pick an artifact above.";
+    return;
+  }
+  box.innerHTML = outputs.map(n => `<button class="btn ghost small" data-art="${esc(n)}">${esc(n)}</button>`).join("");
+  box.querySelectorAll("[data-art]").forEach(b =>
+    b.addEventListener("click", () => openArtifact(b.dataset.art)));
+}
+
+async function openArtifact(name) {
+  $("#art-title").textContent = name;
+  $("#art-body").textContent = "loading…";
+  try {
+    const d = await api(`/api/artifact?slug=${encodeURIComponent(SELECTED)}&name=${encodeURIComponent(name)}`);
+    $("#art-title").textContent = `${name} — ${fmtBytes(d.size)}${d.truncated ? " (truncated)" : ""}`;
+    $("#art-body").textContent = d.text;
+  } catch (e) {
+    $("#art-body").textContent = "Could not read artifact: " + e.message;
+  }
+}
+
+/* ── events / jobs ── */
+function renderEvents(events) {
+  const box = $("#event-log");
+  if (!events || !events.length) { box.innerHTML = `<div class="empty">NO EVENTS YET</div>`; return; }
+  box.innerHTML = events.slice(-120).reverse().map(e => {
+    const at = (e.at || "").slice(11, 19);
+    const step = e.step ? ` [${e.step}/${e.steps}]` : "";
+    return `<div class="ev ${esc(e.kind)}"><span class="t">${esc(at)}</span><b>${esc(e.kind)}${step}</b>${esc(e.note || "")}</div>`;
+  }).join("");
+}
+
+function renderJobs(jobs) {
+  const tb = $("#job-tbody");
+  if (!jobs || !jobs.length) {
+    tb.innerHTML = `<tr><td colspan="6" class="dim" style="text-align:center">NO JOBS RUN YET</td></tr>`;
+    return;
+  }
+  tb.innerHTML = jobs.map(j => {
+    const detail = j.error || (j.result ? summarizeResult(j) : (j.progress?.stage || "—"));
+    const cls = j.status === "done" ? "done" : j.status === "running" ? "running" : "error";
+    return `<tr>
+      <td class="mono">${esc(j.id)}</td>
+      <td class="mono dim">${esc(j.pipeline)}</td>
+      <td><span class="status-pill st-${cls}">${esc(j.status)}</span></td>
+      <td class="mono dim">${esc((j.started_at||"").replace("T"," ").slice(0,19))}</td>
+      <td class="mono dim">${j.elapsed_seconds != null ? j.elapsed_seconds + "s" : "—"}</td>
+      <td class="dim">${esc(String(detail).slice(0, 160))}</td>
+    </tr>`;
+  }).join("");
+}
+
+function summarizeResult(job) {
+  const r = job.result || {};
+  if (job.pipeline === "ingest") return `${r.num_frames ?? "?"} frames → ${r.run_slug ?? ""}`;
+  if (job.pipeline === "transcribe") return `${r.frames_with_text ?? "?"}/${r.frames_selected ?? "?"} frames with text`;
+  if (job.pipeline === "summarize") return `${r.chars ?? 0} char summary`;
+  if (job.pipeline === "reconstruct") return `${r.folders ?? 0} folder(s)`;
+  return JSON.stringify(r).slice(0, 120);
+}
+
+/* ── pipeline form ── */
+function applyNeeds() {
+  const needs = NEEDS[$("#f-pipeline").value] || {};
+  $$("[data-need]").forEach(el => {
+    el.style.display = needs[el.dataset.need] ? "" : "none";
+  });
+}
+$("#f-pipeline").addEventListener("change", applyNeeds);
+
+async function loadVideos() {
+  try {
+    const d = await api("/api/videos?folder=./input");
+    const sel = $("#f-video-pick");
+    sel.innerHTML = `<option value="">— pick from ./input —</option>` +
+      (d.videos || []).map(v => `<option value="${esc(v.path)}">${esc(v.name)} (${fmtBytes(v.size)})</option>`).join("");
+  } catch (e) { /* folder may not exist */ }
+}
+$("#f-video-pick").addEventListener("change", e => { if (e.target.value) $("#f-video").value = e.target.value; });
+
+async function startRun() {
+  const pipeline = $("#f-pipeline").value;
+  const body = {
+    pipeline,
+    backend: $("#f-backend").value,
+    base_url: $("#f-baseurl").value.trim() || null,
+    vision_model: $("#f-vision").value || null,
+    text_model: $("#f-text").value || null,
+  };
+  const needs = NEEDS[pipeline] || {};
+  if (needs.video) {
+    body.video_path = $("#f-video").value.trim();
+    if (!body.video_path) { alert("A video path is required for " + pipeline); return; }
+  }
+  if (needs.run) {
+    body.run_slug = $("#f-run").value;
+    if (!body.run_slug && pipeline === "summarize") { alert("Select a run folder"); return; }
+  }
+  if (pipeline === "ingest") {
+    body.strategy = $("#f-strategy").value;
+    body.fps = parseFloat($("#f-fps").value) || 1.0;
+  }
+  if (pipeline === "transcribe") {
+    body.sample_fps = parseFloat($("#f-samplefps").value) || 2.0;
+    body.cleanup = $("#f-cleanup").checked;
+    body.deterministic = $("#f-deterministic").checked;
+  }
+  try {
+    $("#run-btn").disabled = true;
+    await post("/api/run", body);
+    go("overview");
+    await poll();
+  } catch (e) {
+    alert(e.message || String(e));
+    $("#run-btn").disabled = false;
+  }
+}
+$("#run-btn").addEventListener("click", startRun);
+
+/* ── search ── */
+async function doSearch() {
+  const query = $("#q-query").value.trim();
+  if (!query) { alert("Enter a question"); return; }
+  const slug = $("#q-run").value;
+  if (!slug) { alert("No run selected — ingest a video first"); return; }
+  $("#q-btn").disabled = true;
+  $("#q-status").innerHTML = `<span class="spinner"></span> searching…`;
+  $("#q-results").innerHTML = "";
+  $("#q-summary-panel").style.display = "none";
+  try {
+    const d = await post("/api/search", {
+      query, run_slug: slug,
+      top_k: parseInt($("#q-topk").value) || 10,
+      summarize: $("#q-summarize").checked,
+    });
+    const results = d.results || [];
+    $("#q-status").textContent = `${results.length} hit(s) in ${esc(slug)}`;
+    if (d.summary) {
+      $("#q-summary").textContent = d.summary;
+      $("#q-summary-panel").style.display = "";
+    }
+    $("#q-results").innerHTML = results.length ? results.map(r => `
+      <div class="result-card">
+        <div class="rc-head">
+          <span class="tag amber">${esc(r.timestamp_str || "?")}</span>
+          <span class="tag">score ${(Number(r.score)||0).toFixed(3)}</span>
+          ${r.frame_id != null ? `<span class="tag violet">frame ${r.frame_id}</span>` : ""}
+        </div>
+        <div class="rc-body">${esc(r.caption || "(no caption)")}</div>
+      </div>`).join("") : `<div class="empty">NO MATCHES</div>`;
+  } catch (e) {
+    $("#q-status").innerHTML = `<span style="color:var(--red)">✗ ${esc(e.message)}</span>`;
+  } finally {
+    $("#q-btn").disabled = false;
+  }
+}
+$("#q-btn").addEventListener("click", doSearch);
+$("#q-query").addEventListener("keydown", e => { if (e.key === "Enter") doSearch(); });
+
+/* ── poll ── */
+function applyStatus(health, jobs, events) {
+  const wasBusy = BUSY;
+  BUSY = !!health.busy;
+  const badge = $("#badge-status"), dot = $("#live-dot");
+  const job = (jobs.jobs || []).find(j => j.id === health.active_job_id);
+
+  if (BUSY) {
+    badge.textContent = "RUNNING";
+    badge.className = "badge warn";
+    dot.classList.remove("off");
+    const p = job?.progress || {};
+    $("#live-line").innerHTML =
+      `<span class="spinner"></span> ${esc(job?.pipeline || "job")} · ${esc(p.stage || "starting")}` +
+      (p.note ? ` · ${esc(String(p.note).slice(0,120))}` : "") +
+      (health.current?.slug ? ` · ${esc(health.current.slug)}` : "");
+    $("#run-btn").disabled = true;
+    $("#run-btn").textContent = "RUNNING…";
+  } else {
+    const last = (jobs.jobs || [])[0];
+    const failed = last && last.status === "error";
+    badge.textContent = failed ? "ERROR" : "READY";
+    badge.className = failed ? "badge bad" : "badge ok";
+    dot.classList.add("off");
+    if (failed) {
+      $("#live-line").innerHTML = `<span style="color:var(--red)">✗ ${esc(last.error || "job failed")}</span>`;
+    } else if (last) {
+      $("#live-line").textContent = `${last.pipeline} ${last.status} in ${last.elapsed_seconds ?? "?"}s — ${summarizeResult(last)}`;
+    } else {
+      $("#live-line").textContent = "⟳ no job running";
+    }
+    $("#run-btn").disabled = false;
+    $("#run-btn").textContent = "▶ RUN PIPELINE";
+  }
+  renderEvents(events.events);
+  renderJobs(jobs.jobs);
+
+  // A finished job changes what's on disk — rescan, and follow the run it made.
+  if (wasBusy && !BUSY) {
+    const slug = (jobs.jobs || [])[0]?.result?.run_slug;
+    loadRuns().then(() => { if (slug) selectRun(slug, false); });
+  }
+}
+
+async function poll() {
+  try {
+    const [health, jobs, events] = await Promise.all([
+      api("/api/health"), api("/api/jobs"), api("/api/events?limit=120"),
+    ]);
+    applyStatus(health, jobs, events);
+    renderKPIs();
+  } catch (e) { console.warn(e); }
+}
+
+/* ── wiring ── */
+$("#run-search").addEventListener("input", e => renderRunTable(e.target.value));
+$("#refresh-runs").addEventListener("click", () => loadRuns());
+$("#frames-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED, false));
+$("#art-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED, false));
+$("#f-backend").addEventListener("change", loadBackend);
+$("#f-baseurl").addEventListener("change", loadBackend);
+
+(async function init() {
+  applyNeeds();
+  if (location.hash) {
+    const n = location.hash.slice(1);
+    if ($(`[data-view="${n}"]`)) go(n);
+  }
+  await Promise.all([loadRuns(), loadVideos(), loadBackend()]);
+  renderKPIs();
+  await poll();
+  setInterval(poll, 1500);
+})();
+</script>
+</body>
+</html>

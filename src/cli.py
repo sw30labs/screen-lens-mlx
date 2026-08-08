@@ -30,7 +30,7 @@ from .config import (
     default_inference_backend,
     default_inference_concurrency,
 )
-from .omlx_client import resolve_inference_model
+from .omlx_client import resolve_inference_model, resolve_llm_model, resolve_ocr_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
 from .session import apply_video_slug, load_config
 
@@ -945,6 +945,34 @@ def tui(
     from .tui import run_tui
 
     raise typer.Exit(run_tui(config_file))
+
+
+@app.command()
+def serve(
+    port: int = typer.Option(8760, help="Port for the local command deck"),
+    host: str = typer.Option("127.0.0.1", help="Bind address (loopback only)"),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser tab"),
+    view: Optional[str] = typer.Option(None, help="Open straight to a view: overview, runs, frames, search, pipeline, artifacts"),
+):
+    """Launch the web command deck — a local dashboard over every pipeline.
+
+    Binds loopback-only by design: it starts jobs and reads frames off disk.
+    """
+    from .web.server import serve as serve_dashboard
+
+    console.print(Panel.fit(
+        f"[bold green]ScreenLens — Web Command Deck[/bold green]\n"
+        f"URL: http://{host}:{port}\n"
+        f"Vision model: {resolve_ocr_model(_load_config(None).ocr)}\n"
+        f"Text model: {resolve_llm_model(_load_config(None).reconstruction)}",
+        title="Configuration",
+    ))
+    serve_dashboard(
+        host=host,
+        port=port,
+        open_browser=not no_browser,
+        query=f"#{view}" if view else "",
+    )
 
 
 @app.command()

@@ -28,3 +28,15 @@ all = ["textual>=0.80"]
 
 [project.scripts]
 screenlens = "src.cli:app"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["src", "src.*"]
+
+# The command deck is a single static page plus a favicon; they must ship with
+# the wheel or `screenlens serve` has nothing to serve.
+[tool.setuptools.package-data]
+"src.web" = ["static/*"]
