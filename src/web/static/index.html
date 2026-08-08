@@ -549,6 +549,13 @@ pre.doc {
             <label class="rf-label">Sample FPS</label>
             <input class="input" id="f-samplefps" type="number" step="0.5" value="2.0" />
           </div>
+          <div data-need="ingest">
+            <label class="rf-label">Caption token budget</label>
+            <input class="input" id="f-captiontokens" type="number" step="128" min="128" value="1500" />
+            <div class="hint">Max output tokens per caption. Leave empty for the config default (the
+              full context) — on a dense frame that lets the model run past the real content into a
+              repetition loop, costing tens of minutes per frame.</div>
+          </div>
           <div>
             <label class="rf-label">Vision model (captions / OCR)</label>
             <select class="input" id="f-vision"></select>
@@ -1095,6 +1102,7 @@ async function startRun() {
   if (pipeline === "ingest") {
     body.strategy = $("#f-strategy").value;
     body.fps = parseFloat($("#f-fps").value) || 1.0;
+    body.caption_max_tokens = parseInt($("#f-captiontokens").value) || null;
   }
   if (pipeline === "transcribe") {
     body.sample_fps = parseFloat($("#f-samplefps").value) || 2.0;
@@ -1165,8 +1173,9 @@ function applyStatus(health, jobs, events) {
     badge.className = "badge warn";
     dot.classList.remove("off");
     const p = job?.progress || {};
+    const pct = p.steps ? ` <b style="color:var(--cyan)">${Math.round(100 * p.step / p.steps)}%</b>` : "";
     $("#live-line").innerHTML =
-      `<span class="spinner"></span> ${esc(job?.pipeline || "job")} · ${esc(p.stage || "starting")}` +
+      `<span class="spinner"></span> ${esc(job?.pipeline || "job")} · ${esc(p.stage || "starting")}${pct}` +
       (p.note ? ` · ${esc(String(p.note).slice(0,120))}` : "") +
       (health.current?.slug ? ` · ${esc(health.current.slug)}` : "");
     $("#run-btn").disabled = true;

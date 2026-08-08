@@ -117,17 +117,25 @@ def apply_direct_inference(
     vision_model: Optional[str] = None,
     text_model: Optional[str] = None,
     batch_size: Optional[int] = None,
+    caption_max_tokens: Optional[int] = None,
 ) -> None:
     """Wire one OpenAI-compatible endpoint into every role of ``config``.
 
     ``vision_model`` drives captioning + OCR; ``text_model`` drives
     reconstruction/cleanup/summary. Either may be ``None`` to keep the
     environment-resolved default for that role.
+
+    ``caption_max_tokens`` bounds how long one caption may run. It matters more
+    than it looks: left at the full context, a dense frame keeps the model
+    generating long past the real content and into a degenerate repetition
+    loop, which costs tens of minutes per frame.
     """
     caption_backend = CaptionBackend(backend)
     config.captioning.backend = caption_backend
     if batch_size is not None:
         config.captioning.batch_size = batch_size
+    if caption_max_tokens is not None:
+        config.captioning.max_tokens = caption_max_tokens
 
     if caption_backend == CaptionBackend.ollama:
         # Captions come from Ollama; the direct roles keep their own endpoint.

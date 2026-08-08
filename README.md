@@ -123,6 +123,27 @@ python -m src.cli ingest video.mov \
 
 `--vllm-url`, `--vllm-model`, and `--vllm-api-key` are provider-specific aliases; the existing `--omlx-*` spellings remain compatible. `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, and `SCREENLENS_BATCH_SIZE` override platform defaults. Provider credentials and models can also come from `VLLM_*`, `MLX_*`, or `OMLX_*` variables as appropriate.
 
+### Model Roles
+
+ScreenLens drives two roles against one OpenAI-compatible endpoint:
+
+| Role | Used by | Requirement | oMLX default |
+|---|---|---|---|
+| **vision** | captioning, verbatim OCR | must be vision-capable — a text-only model answers "no image provided" for every frame | `Qwen3.6-27B-bf16` (`OCR_MODEL` / `MLX_MODEL`) |
+| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; a reasoning model is the right pick | `DeepSeek-V4-Flash-0731-MLX` (`LLM_MODEL`) |
+
+On DGX Spark both resolve to the single served vLLM checkpoint, so the split
+costs nothing there. On Apple Silicon they are normally two different oMLX
+models loaded side by side. Check what your endpoint serves and which side of
+the line each model falls on:
+
+```bash
+python -m src.cli models
+```
+
+The capability guard aborts a `transcribe` run whose OCR model is text-only,
+and the command deck's vision selector only offers models that can see.
+
 ### Ingest and Search
 
 ```bash
@@ -176,6 +197,27 @@ python -m src.cli transcribe input-videos/code.mov --deterministic
 ```
 
 The transcribe path copies visible text rather than describing it. A live image probe rejects blind/text-only deployments before a full run. Cleanup is off by default; when enabled, a per-chunk coverage guard keeps the raw stitched chunk whenever the model drops content. Outputs are `transcript.raw.md`, `transcript.md`, `ocr/all_ocr.json`, and metadata under the timestamped data directory.
+
+### Web command deck
+
+```bash
+python -m src.cli serve                 # http://127.0.0.1:8760, opens a browser
+python -m src.cli serve --port 9000 --no-browser
+python -m src.web                       # same thing without Typer
+```
+
+A local dashboard over every pipeline: run register, frame gallery served
+straight off disk, semantic search, pipeline control, and an artifact reader.
+It is stdlib `http.server` plus one static page — no framework, no build step,
+and no dependency beyond what ScreenLens already installs.
+
+It binds loopback-only and refuses non-loopback clients on every `/api/` route,
+because it starts jobs and reads frames off disk. One job runs at a time: the
+pipelines share a single model endpoint and one CLIP device.
+
+The header shows both model roles at once. If the configured vision model is
+not vision-capable the badge turns red before you waste a run on it, and the
+vision selector only offers models that can actually see.
 
 ### Status and TUI
 
@@ -256,11 +298,17 @@ src/
   stitch.py            # Text-space scroll-overlap stitching
   transcribe.py        # Verbatim pipeline and guarded cleanup
   omlx_client.py       # Shared inference client; legacy module name retained
+  session.py           # Shared config/slug/run-discovery layer for all front ends
   cli.py               # Typer CLI
   tui.py               # Optional Textual terminal GUI
+  web/                 # Web command deck (stdlib HTTP, no build step)
+    server.py          # Loopback-only JSON API + static page
+    runner.py          # One-job-at-a-time background runner
+    static/index.html  # Single-file SPA
 tests/
   test_pipeline.py     # Core configuration, inference, embedding, and graph tests
   test_transcribe.py   # Stitching, OCR guards, and cleanup safety
+  test_web.py          # Command deck assets, API contracts, and security
   test_cases.yaml      # Dual-platform/DGX end-to-end scenarios
 ```
 

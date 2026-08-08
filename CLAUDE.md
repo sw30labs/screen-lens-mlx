@@ -46,6 +46,10 @@ python -m src.cli transcribe "doc.mov" --cleanup          # run the optional LLM
 # List models from the selected vLLM/oMLX endpoint
 python -m src.cli models
 
+# Web command deck (local dashboard over every pipeline)
+python -m src.cli serve                      # http://127.0.0.1:8760
+python -m src.web --port 9000 --no-browser
+
 # Vector store stats
 python -m src.cli info
 
@@ -67,6 +71,25 @@ pytest tests/test_pipeline.py::TestEmbedder::test_embed_text -v   # one test
 ## Architecture
 
 The codebase has two LangGraph `StateGraph` pipelines plus the straight-line transcribe path. They share one `ScreenLensConfig` and the provider-neutral `InferenceClient` in the legacy-named `omlx_client.py` module.
+
+Three front ends drive those pipelines — `cli.py` (Typer), `tui.py` (Textual), and `web/` (the command deck). All three build on `session.py`, which owns config loading, per-video slug allocation, role-aware inference wiring, and read-only run discovery. Put anything a second front end would otherwise copy there; the config/slug helpers were duplicated between the CLI and TUI before it existed.
+
+### Model roles (`src/session.py`)
+
+Two roles resolve separately against one endpoint:
+
+- **vision** — captioning (`captioner.py`) and OCR (`ocr.py`). Must be vision-capable.
+- **text** — search/full-video summaries, reconstruction plan/QA, transcript cleanup. Never sees an image.
+
+`text_role_captioning_config()` builds the text-role client from `config.reconstruction`; `pipeline.py` and `reconstruct.py` both go through it, so text work never lands on the vision model. On Spark both roles resolve to the single served vLLM checkpoint, making the split a no-op there. On Apple the oMLX defaults are `Qwen3.6-27B-bf16` for vision and `DeepSeek-V4-Flash-0731-MLX` for text.
+
+### Front end 3 — Web command deck (`src/web/`)
+
+Stdlib `http.server` only — the same ADR-008 pattern as contingency-atlas and book-buddy-2026: hand-rolled JSON handlers, one static page, no framework and no build step, so the GUI adds no dependency.
+
+- `server.py` — loopback-only bind plus a per-request loopback check on every `/api/` route. Run slugs, artifact names and frame names are contained *by name* (no separators, no dotfiles, resolved parent must match) rather than resolved, and frames/artifacts are restricted to known-safe suffixes so an `.env` sitting beside a transcript is not readable.
+- `runner.py` — one job at a time behind a lock (the pipelines share one model endpoint and one CLIP device). Pipeline `print()`/`logging` output is captured into a ring buffer the page tails, the same approach `tui.py` uses. `set_pipeline_override` is the test seam: `tests/test_web.py` exercises the whole job lifecycle without a model, GPU, or ffmpeg.
+- `static/index.html` — the SPA. If you add an endpoint, `test_index_calls_only_real_endpoints` will catch a page that calls something the server does not serve.
 
 ### Pipeline 1 — Ingest / Search (`src/pipeline.py`)
 
@@ -157,6 +180,8 @@ data/<slug>/
 - **Transcribe OCR must use a vision model.** Spark defaults to the checked NVIDIA Qwen checkpoint; Apple retains its recommended oMLX OCR model. A text-only choice aborts via the capability guard + live probe.
 - **`disable_thinking` stays on for OCR/cleanup.** Turning it off with a reasoning model regresses to truncated, all-reasoning output (see `tests/test_transcribe.py::test_strip_thinking_handles_truncated_open_tag`).
 - **Don't size cleanup chunks past the output token cap.** Chunk input is intentionally bounded by `max_tokens`, not just `model_context` — otherwise output truncates mid-chunk and silently loses content.
+- **Caption token budget is not free.** `CaptioningConfig.max_tokens` defaults to the full context. On a dense frame the model keeps generating past the real content and degenerates into a repetition loop (observed: `'E0000000…'` for thousands of tokens, tens of minutes per frame on oMLX). The repetition guards are honoured by both servers but do not bound runtime — a bounded budget does. The command deck exposes it per run and defaults to 1500.
+- **Text work must not land on the vision model.** Route it through `session.text_role_captioning_config()`, never `InferenceClient(config.captioning)` directly.
 - **DGX concurrency stays at two.** The bundled vLLM service admits two sequences and shares one 128 GB unified-memory pool with OpenCLIP and the OS. Do not raise it casually. oMLX may serialize requests for a loaded model; tune Apple concurrency to the host.
 - **Do not start two port-8000 stacks.** The Spark helper reuses DigitalTwin's exact-model endpoint and only manages containers created by this repository. See `docs/DGX_SPARK.md`.
 

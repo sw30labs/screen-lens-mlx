@@ -183,6 +183,11 @@ def list_videos(folder: str) -> list[dict[str, Any]]:
 # ── event capture ───────────────────────────────────────────────────────────
 
 _PROGRESS_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.+)$")
+# tqdm redraws in place with \r, e.g.
+#   "Captioning frames:  40%|####      | 8/20 [08:23<12:38, 63.22s/it]"
+# Without this the dashboard would show only the stage banner for the whole of
+# a twenty-minute captioning pass.
+_TQDM_RE = re.compile(r"^(?P<desc>.*?):?\s*\d+%\|.*?\|\s*(?P<n>\d+)/(?P<total>\d+)\s*\[(?P<timing>[^\]]*)\]")
 
 
 def _emit(kind: str, note: str, **extra: Any) -> None:
@@ -200,6 +205,11 @@ def _emit(kind: str, note: str, **extra: Any) -> None:
         progress["events"] = int(progress.get("events") or 0) + 1
         if kind == "stage":
             progress["stage"] = note
+        elif kind == "progress":
+            progress["note"] = note
+            if extra.get("steps"):
+                progress["step"] = extra.get("step")
+                progress["steps"] = extra.get("steps")
         elif kind == "error":
             progress["note"] = f"ERROR: {note}"
         else:
@@ -212,6 +222,7 @@ class _EventStream(io.TextIOBase):
     def __init__(self, mirror: io.TextIOBase | None = None) -> None:
         self._buf = ""
         self._mirror = mirror
+        self._last_progress: tuple[str, int] | None = None
 
     def writable(self) -> bool:
         return True
@@ -221,8 +232,13 @@ class _EventStream(io.TextIOBase):
             with contextlib.suppress(Exception):
                 self._mirror.write(s)
         self._buf += s
-        while "\n" in self._buf:
-            line, self._buf = self._buf.split("\n", 1)
+        # Split on \r as well as \n so in-place progress bars are seen at all.
+        while True:
+            cut = min((i for i in (self._buf.find("\n"), self._buf.find("\r")) if i >= 0),
+                      default=-1)
+            if cut < 0:
+                break
+            line, self._buf = self._buf[:cut], self._buf[cut + 1:]
             self._handle(line)
         return len(s)
 
@@ -235,6 +251,19 @@ class _EventStream(io.TextIOBase):
         text = line.rstrip()
         if not text or set(text) <= {"=", "-", "─"}:
             return
+
+        bar = _TQDM_RE.match(text)
+        if bar:
+            n, total = int(bar.group("n")), int(bar.group("total"))
+            desc = (bar.group("desc") or "working").strip() or "working"
+            # tqdm redraws many times per step; only the step changes matter.
+            if (desc, n) == self._last_progress:
+                return
+            self._last_progress = (desc, n)
+            _emit("progress", f"{desc} {n}/{total} [{bar.group('timing')}]",
+                  step=n, steps=total)
+            return
+
         match = _PROGRESS_RE.match(text)
         if match:
             _emit("stage", match.group(3).strip(), step=int(match.group(1)),
@@ -287,6 +316,9 @@ def _build_config(params: dict[str, Any]) -> ScreenLensConfig:
         vision_model=(str(params["vision_model"]) if params.get("vision_model") else None),
         text_model=(str(params["text_model"]) if params.get("text_model") else None),
         batch_size=(int(params["batch_size"]) if params.get("batch_size") else None),
+        caption_max_tokens=(
+            int(params["caption_max_tokens"]) if params.get("caption_max_tokens") else None
+        ),
     )
     return config
 

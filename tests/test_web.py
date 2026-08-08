@@ -285,6 +285,25 @@ class TestWebAPI:
         stage = next(e for e in body["events"] if e["note"] == "EXTRACTING FRAMES")
         assert (stage["step"], stage["steps"]) == (1, 3)
 
+    def test_tqdm_progress_reaches_the_dashboard(self, server, data_root):
+        """tqdm redraws with \r, so a naive line splitter shows nothing for
+        the whole of a twenty-minute captioning pass."""
+        def with_bar(params, config):
+            import sys
+            sys.stdout.write("Captioning frames:   0%|   | 0/20 [00:00<?, ?it/s]\r")
+            sys.stdout.write("Captioning frames:  20%|## | 4/20 [04:05<16:23, 61.48s/it]\r")
+            sys.stdout.write("Captioning frames:  20%|## | 4/20 [04:06<16:20, 61.40s/it]\r")
+            sys.stdout.write("Captioning frames: 100%|###| 20/20 [20:10<00:00, 60.5s/it]\r")
+            return {"ok": True}
+
+        runner.set_pipeline_override("reconstruct", with_bar)
+        post(server, "/api/run", {"pipeline": "reconstruct"})
+        _wait_idle()
+        _, body = get(server, "/api/events?limit=50")
+        steps = [(e["step"], e["steps"]) for e in body["events"] if e["kind"] == "progress"]
+        # Redraws of the same step must not flood the ring buffer.
+        assert steps == [(0, 20), (4, 20), (20, 20)]
+
 
 # ── security ────────────────────────────────────────────────────────────────
 
