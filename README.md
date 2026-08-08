@@ -130,12 +130,22 @@ ScreenLens drives two roles against one OpenAI-compatible endpoint:
 | Role | Used by | Requirement | oMLX default |
 |---|---|---|---|
 | **vision** | captioning, verbatim OCR | must be vision-capable — a text-only model answers "no image provided" for every frame | `Qwen3.6-27B-bf16` (`OCR_MODEL` / `MLX_MODEL`) |
-| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; a reasoning model is the right pick | `DeepSeek-V4-Flash-0731-MLX` (`LLM_MODEL`) |
+| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; must stay coherent on markdown with indented lists, which is what captions are | `Qwen3.6-27B-bf16` (`LLM_MODEL`) |
 
-On DGX Spark both resolve to the single served vLLM checkpoint, so the split
-costs nothing there. On Apple Silicon they are normally two different oMLX
-models loaded side by side. Check what your endpoint serves and which side of
-the line each model falls on:
+On DGX Spark both resolve to the single served vLLM checkpoint. The defaults do
+the same on Apple Silicon — one resident checkpoint serving both roles — but the
+roles resolve independently, so pointing `LLM_MODEL` at a dedicated text model
+is fully supported.
+
+Test any such model against a real caption first. `DeepSeek-V4-Flash-0731-MLX`
+under oMLX emits its BOS token until the token budget runs out when the prompt
+contains a markdown list item with a leading indent (`\n   - `), which every
+caption has. ScreenLens detects that shape and raises `InferenceDegenerateError`
+rather than saving the output as a summary, so the failure is loud rather than
+silent — but the model still cannot do the work.
+
+Check what your endpoint serves and which side of the vision line each model
+falls on:
 
 ```bash
 python -m src.cli models
