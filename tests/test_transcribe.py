@@ -265,3 +265,16 @@ def test_select_frames_on_real_video(tmp_path):
     # timestamps strictly increasing
     ts = [m["timestamp"] for m in meta]
     assert ts == sorted(ts)
+
+
+def test_transcribe_reports_degenerate_frames_without_editing_them():
+    """A frame where the OCR model got stuck must be flagged, not trimmed —
+    the raw transcript is defined as byte-faithful to what the model read."""
+    from src.omlx_client import degenerate_repetition
+
+    stuck = "INSERT INTO t VALUES ('a', 'b');\n" + "!" * 400
+    assert degenerate_repetition(stuck) == "!"
+
+    # A screen that genuinely repeats whole statements is not "stuck".
+    faithful = "INSERT INTO t VALUES (1, 'abc', 'def');\n" * 20
+    assert degenerate_repetition(faithful) is None
