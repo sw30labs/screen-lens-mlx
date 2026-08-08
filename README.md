@@ -225,6 +225,14 @@ It binds loopback-only and refuses non-loopback clients on every `/api/` route,
 because it starts jobs and reads frames off disk. One job runs at a time: the
 pipelines share a single model endpoint and one CLIP device.
 
+**There is no stop button.** A running job cannot be cancelled from the page:
+interrupting it would mean aborting the in-flight HTTP request to the model
+server, which the stdlib client cannot do mid-read. Jobs run as daemon threads,
+so stopping the deck (Ctrl-C) ends them — the model server may keep generating
+the current request for a while afterwards. This matters more than it sounds:
+`reconstruct` over a large caption set can run for hours (see Performance
+Notes), so check the run size before starting one.
+
 The header shows both model roles at once. If the configured vision model is
 not vision-capable the badge turns red before you waste a run on it, and the
 vision selector only offers models that can actually see.
@@ -278,6 +286,19 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 | `reconstruction.timeout_seconds` | 1800 | Timeout for long-running reconstruction generations |
 
 ## Performance Notes
+
+### Reconstruction cost on Apple Silicon
+
+`reconstruct` gives every extraction pass the whole model context as its output
+ceiling, so vLLM can compute the exact remaining completion space per prompt.
+On Spark that is close to free. On oMLX it is not: a measured 20-caption run
+(98k characters of captions) spent over three hours in Pass 1 alone, because
+each of its three segments generated 20–30k tokens at 6–12 tok/s and two of
+them exhausted the 32K ceiling and split into two passes each.
+
+Before reaching for `reconstruct` on Apple Silicon, check whether `summarize`
+is what you actually want — it chunks to a bounded output and finished the same
+run in four minutes.
 
 Direct backends receive one OpenAI-compatible image request per frame. Image encoding and prompt prefill usually dominate short captions, so the main levers are frame dimensions, model size, and request concurrency. The bundled Spark service admits two sequences and ScreenLens therefore defaults to two requests there. Apple defaults to four, but large oMLX models may benefit from a lower value. Concurrent results are isolated per frame: one failed request cannot overwrite a successful peer in the same chunk. A failed frame is retried once deterministically with a bounded 2K completion ceiling. A retry that fills that ceiling without terminating is rejected instead of storing a truncated loop; ScreenLens stores an error marker for that frame alone.
 
