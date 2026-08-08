@@ -23,6 +23,8 @@ from .captioner import caption_frames
 from .embedder import CLIPEmbedder
 from .omlx_client import (
     InferenceClient,
+    InferenceDegenerateError,
+    degenerate_repetition,
     resolve_inference_context,
     resolve_inference_model,
 )
@@ -259,14 +261,23 @@ def _inference_text_generate(
     max_tokens: int = 2048,
     temperature: float = 0.3,
 ) -> str:
-    """Generate text through the configured OpenAI-compatible server."""
-    return client.chat(
+    """Generate text through the configured OpenAI-compatible server.
+
+    A summary is presented to the user as an answer and written to disk, so a
+    model that has fallen into a repetition loop must not have its output pass
+    for one — report the failure instead of saving it.
+    """
+    text = client.chat(
         system_prompt,
         user_prompt,
         max_tokens=max_tokens,
         temperature=temperature,
         extra={"chat_template_kwargs": {"enable_thinking": False}},
     )
+    unit = degenerate_repetition(text)
+    if unit is not None:
+        raise InferenceDegenerateError(client.backend.value, client.model, unit)
+    return text
 
 
 # Code, punctuation runs, and malformed repeated output tokenize far more

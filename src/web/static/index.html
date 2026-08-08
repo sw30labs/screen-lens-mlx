@@ -850,7 +850,7 @@ async function loadRuns() {
   renderRunProgress();
   renderStageTrack();
   fillRunSelects();
-  if (!SELECTED && RUNS.length) selectRun(RUNS[0].slug, false);
+  if (!SELECTED && RUNS.length) selectRun(RUNS[0].slug);
   return d;
 }
 
@@ -883,7 +883,7 @@ function renderRunTable(filter="") {
       <td class="mono dim">${fmtTime(r.modified)}</td>
     </tr>`).join("");
   tb.querySelectorAll("tr").forEach(tr =>
-    tr.addEventListener("click", () => selectRun(tr.dataset.slug, true)));
+    tr.addEventListener("click", () => selectRun(tr.dataset.slug)));
 }
 
 function renderRunProgress() {
@@ -899,7 +899,7 @@ function renderRunProgress() {
     </div>`;
   }).join("");
   box.querySelectorAll(".risk-row").forEach(row =>
-    row.addEventListener("click", () => { selectRun(row.dataset.slug, true); go("runs"); }));
+    row.addEventListener("click", () => { selectRun(row.dataset.slug); go("runs"); }));
 }
 
 function renderStageTrack() {
@@ -934,7 +934,7 @@ function renderKPIs() {
     </div>`).join("");
 }
 
-async function selectRun(slug, jump) {
+async function selectRun(slug) {
   if (!slug) return;
   SELECTED = slug;
   renderRunTable($("#run-search").value);
@@ -1204,7 +1204,7 @@ function applyStatus(health, jobs, events) {
   // A finished job changes what's on disk — rescan, and follow the run it made.
   if (wasBusy && !BUSY) {
     const slug = (jobs.jobs || [])[0]?.result?.run_slug;
-    loadRuns().then(() => { if (slug) selectRun(slug, false); });
+    loadRuns().then(() => { if (slug) selectRun(slug); });
   }
 }
 
@@ -1221,8 +1221,8 @@ async function poll() {
 /* ── wiring ── */
 $("#run-search").addEventListener("input", e => renderRunTable(e.target.value));
 $("#refresh-runs").addEventListener("click", () => loadRuns());
-$("#frames-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED, false));
-$("#art-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED, false));
+$("#frames-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED));
+$("#art-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED));
 $("#f-backend").addEventListener("change", loadBackend);
 $("#f-baseurl").addEventListener("change", loadBackend);
 

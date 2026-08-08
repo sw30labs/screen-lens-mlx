@@ -583,6 +583,111 @@ class TestOMLXClient:
             client.chat("system", "user")
 
 
+    @pytest.mark.parametrize("text,flagged", [
+        ("<\uff5cbegin\u2581of\u2581sentence\uff5c>" * 30, True),
+        ("INSERT INTO scenarios VALUES ('E" + "0" * 400, True),
+        ("The screen shows a spreadsheet. " * 3 + "0" * 500, True),
+        ("Too short to judge.", False),
+        ("def f(x):\n    return x + 1\n" * 8, False),
+        ("INSERT INTO t VALUES (1, 'abc', 'def');\n" * 20, False),
+        ("\n".join(f"- item {i} with a distinct description" for i in range(40)), False),
+    ])
+    def test_degenerate_repetition_detects_stuck_decoders_only(self, text, flagged):
+        """A stuck decoder repeats one short token; reconstructed code repeats
+        whole statements and must not be mistaken for it."""
+        from src.omlx_client import degenerate_repetition
+
+        assert bool(degenerate_repetition(text)) is flagged
+
+    def test_degenerate_output_is_rejected_not_saved(self, monkeypatch):
+        """A stuck decoder must not have its output stored as a result."""
+        from src.omlx_client import InferenceClient, InferenceDegenerateError
+        import src.omlx_client as inference_client
+
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{
+                        "message": {"content": "<BOS>" * 60},
+                        "finish_reason": "stop",
+                    }],
+                }).encode("utf-8")
+
+        monkeypatch.setattr(inference_client, "_urlopen", lambda req, timeout: FakeResponse())
+        client = InferenceClient.from_endpoint(
+            base_url="http://127.0.0.1:8000/v1",
+            model="text-model",
+            api_key="local",
+            backend="omlx",
+            default_max_tokens=4096,
+        )
+
+        with pytest.raises(InferenceDegenerateError, match="degenerate repeated output"):
+            client.chat("system", "user", require_complete=True)
+
+        # Without require_complete the caller still gets the text, but warned.
+        assert client.chat("system", "user").startswith("<BOS>")
+
+    def test_system_turn_is_folded_for_models_that_mishandle_it(self):
+        """DeepSeek-V4-Flash under oMLX emits its BOS token to the token limit
+        when given a system turn; the same instruction in the user turn works."""
+        from src.config import CaptionBackend, CaptioningConfig
+        from src.omlx_client import InferenceClient, mishandles_system_role
+
+        assert mishandles_system_role("DeepSeek-V4-Flash-0731-MLX")
+        assert not mishandles_system_role("Qwen3.6-27B-bf16")
+
+        captured = {}
+
+        def fake_post(self, payload, **kwargs):
+            captured["messages"] = payload["messages"]
+            return "ok"
+
+        config = CaptioningConfig(
+            backend=CaptionBackend.omlx, omlx_model="DeepSeek-V4-Flash-0731-MLX"
+        )
+        client = InferenceClient(config)
+        client._post_chat = fake_post.__get__(client, type(client))
+        client.chat("SYSTEM RULES", "USER QUESTION")
+
+        assert [m["role"] for m in captured["messages"]] == ["user"]
+        assert captured["messages"][0]["content"] == "SYSTEM RULES\n\nUSER QUESTION"
+
+    def test_system_turn_is_kept_for_models_that_handle_it(self):
+        from src.config import CaptionBackend, CaptioningConfig
+        from src.omlx_client import InferenceClient
+
+        captured = {}
+
+        def fake_post(self, payload, **kwargs):
+            captured["messages"] = payload["messages"]
+            return "ok"
+
+        client = InferenceClient(
+            CaptioningConfig(backend=CaptionBackend.omlx, omlx_model="Qwen3.6-27B-bf16")
+        )
+        client._post_chat = fake_post.__get__(client, type(client))
+        client.chat("SYSTEM RULES", "USER QUESTION")
+
+        assert [m["role"] for m in captured["messages"]] == ["system", "user"]
+
+    def test_folded_system_turn_survives_image_content_blocks(self):
+        """Captioning sends content blocks, not a bare string."""
+        from src.omlx_client import _prepend_instruction
+
+        blocks = [{"type": "text", "text": "describe this"},
+                  {"type": "image_url", "image_url": {"url": "data:..."}}]
+        out = _prepend_instruction("RULES", blocks)
+        assert out[0]["text"] == "RULES\n\ndescribe this"
+        assert out[1]["type"] == "image_url"
+
+
 class TestCaptioner:
     """Test caption generation controls without contacting oMLX."""
 
@@ -843,6 +948,39 @@ class TestPipeline:
         assert captured["kwargs"]["extra"] == {
             "chat_template_kwargs": {"enable_thinking": False},
         }
+
+    def test_summary_refuses_to_present_degenerate_output_as_an_answer(self, monkeypatch):
+        """A summary is shown to the user and written to disk; a model stuck in
+        a repetition loop must not have its output pass for one."""
+        import src.pipeline as pipeline
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
+        from src.omlx_client import InferenceDegenerateError
+
+        class FakeClient:
+            backend = InferenceBackend.omlx
+            model = "text-model"
+
+            def __init__(self, config):
+                pass
+
+            def chat(self, system, user, **kwargs):
+                return "<BOS>" * 60
+
+        monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend.omlx
+        config.reconstruction.backend = InferenceBackend.omlx
+
+        with pytest.raises(InferenceDegenerateError, match="degenerate repeated output"):
+            pipeline.summarize_node({
+                "query": "what is shown?",
+                "search_results": [{
+                    "timestamp_str": "00:00:01.000",
+                    "caption": "A terminal.",
+                    "score": 0.9,
+                }],
+                "config": config.model_dump(),
+            })
 
     def test_caption_chunks_budget_each_skewed_caption_in_order(self):
         from src.pipeline import (

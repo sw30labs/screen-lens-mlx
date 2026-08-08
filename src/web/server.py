@@ -68,6 +68,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # ── GET ─────────────────────────────────────────────────────────────────
 
     def do_GET(self) -> None:  # noqa: N802
+        try:
+            self._do_get()
+        except Exception as exc:  # a dead socket is worse than a 500
+            logger.exception("unhandled error serving %s", self.path)
+            with contextlib.suppress(Exception):
+                self._send_json(
+                    {"error": f"{type(exc).__name__}: {exc}"}, status=500
+                )
+
+    def _do_get(self) -> None:
         path = self.path.split("?", 1)[0]
         query = parse_qs(urlparse(self.path).query)
 
@@ -169,6 +179,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
     # ── POST ────────────────────────────────────────────────────────────────
 
     def do_POST(self) -> None:  # noqa: N802
+        try:
+            self._do_post()
+        except Exception as exc:  # a dead socket is worse than a 500
+            logger.exception("unhandled error serving %s", self.path)
+            with contextlib.suppress(Exception):
+                self._send_json(
+                    {"error": f"{type(exc).__name__}: {exc}"}, status=500
+                )
+
+    def _do_post(self) -> None:
         path = self.path.split("?", 1)[0]
         if path not in ("/api/run", "/api/search"):
             self.send_error(404, "Not found")
@@ -186,7 +206,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
             return  # _read_json_body already answered
 
         if path == "/api/search":
-            result = runner.search_now(body)
+            # Search runs inline, so a model failure surfaces here rather than
+            # in a job record. Answer with it instead of dropping the socket.
+            try:
+                result = runner.search_now(body)
+            except Exception as exc:
+                logger.exception("search failed")
+                self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
             self._send_json(result, status=400 if result.get("error") else 200)
             return
 

@@ -98,6 +98,86 @@ class InferenceTruncatedError(RuntimeError):
         )
 
 
+class InferenceDegenerateError(RuntimeError):
+    """Raised when a required generation is degenerate repetition, not an answer."""
+
+    def __init__(self, backend: str, model: str, sample: str):
+        self.backend = backend
+        self.model = model
+        super().__init__(
+            f"{backend} model {model} returned degenerate repeated output "
+            f"({sample!r}…); it was discarded rather than saved as a result"
+        )
+
+
+# A model that loses coherence emits one token forever. Left unchecked that
+# lands in summary.md or a reconstructed artifact and is reported as success.
+_DEGENERATE_MIN_CHARS = 200
+_DEGENERATE_REPEAT_RATIO = 0.6
+# A stuck decoder repeats one short token, not a paragraph. Bounding the unit
+# length and demanding many repeats keeps legitimately repetitive reconstructed
+# code (identical short statements, table rows) out of the net.
+_DEGENERATE_MAX_UNIT = 24
+_DEGENERATE_MIN_REPEATS = 6
+
+
+def degenerate_repetition(text: str | None) -> str | None:
+    """Return the repeated unit when ``text`` is mostly one repeated token.
+
+    Deliberately narrow: it looks for a single short unit repeated back-to-back
+    over most of the output (e.g. a BOS token emitted forever), not for prose
+    or code that merely repeats a phrase.
+    """
+    if not text:
+        return None
+    stripped = text.strip()
+    total = len(stripped)
+    if total < _DEGENERATE_MIN_CHARS:
+        return None
+    # Anchor on the tail: a run that loses coherence never recovers, so the
+    # repetition ends the output even when sane text precedes it ("E0000…").
+    for unit_len in range(1, _DEGENERATE_MAX_UNIT + 1):
+        unit = stripped[-unit_len:]
+        if not unit.strip():
+            continue
+        repeats = 0
+        end = total
+        while end >= unit_len and stripped.startswith(unit, end - unit_len):
+            repeats += 1
+            end -= unit_len
+        if repeats >= _DEGENERATE_MIN_REPEATS and (total - end) >= total * _DEGENERATE_REPEAT_RATIO:
+            return unit
+    return None
+
+
+# Models whose chat template mishandles a system turn on the OpenAI-compatible
+# path. Verified on DeepSeek-V4-Flash-0731-MLX under oMLX (2026-08): a
+# multi-sentence system message makes it emit its BOS token until the token
+# budget runs out, while the identical instruction folded into the user turn
+# answers normally. The template has no `system` branch in its message loop —
+# it splices the content in raw ahead of `<｜User｜>`.
+_SYSTEM_ROLE_BROKEN_PATTERNS = ("deepseek-v4",)
+
+
+def mishandles_system_role(model_id: str | None) -> bool:
+    """True when the system prompt must be folded into the user turn."""
+    if not model_id:
+        return False
+    return any(p in normalized_model_id(model_id) for p in _SYSTEM_ROLE_BROKEN_PATTERNS)
+
+
+def _prepend_instruction(system_prompt: str, user_content: Any) -> Any:
+    """Put ``system_prompt`` at the head of a user turn, text or content blocks."""
+    if isinstance(user_content, str):
+        return f"{system_prompt}\n\n{user_content}"
+    blocks = list(user_content)
+    for index, block in enumerate(blocks):
+        if block.get("type") == "text":
+            blocks[index] = {**block, "text": f"{system_prompt}\n\n{block.get('text', '')}"}
+            return blocks
+    return [{"type": "text", "text": system_prompt}, *blocks]
+
+
 def is_draft_model(model_id: str | None) -> bool:
     """True for speculative-decode draft models (not usable standalone)."""
     if not model_id:
@@ -525,12 +605,20 @@ class OpenAICompatibleClient:
         requested_max_tokens = (
             max_tokens if max_tokens is not None else self._default_max_tokens
         )
-        payload = {
-            "model": self.model,
-            "messages": [
+        if system_prompt and mishandles_system_role(self.model):
+            # See _SYSTEM_ROLE_BROKEN_PATTERNS: a system turn makes these models
+            # emit their BOS token until the budget runs out. The same
+            # instruction at the head of the user turn answers normally.
+            messages = [{"role": "user", "content": _prepend_instruction(system_prompt, user_content)}]
+        else:
+            messages = [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_content},
-            ],
+            ]
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
             "temperature": temperature if temperature is not None else self._default_temperature,
             "stream": False,
         }
@@ -735,10 +823,26 @@ class OpenAICompatibleClient:
             )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):
-                return _message_text(first["message"].get("content"))
-            if "text" in first:
-                return str(first["text"])
-        return str(first)
+                text = _message_text(first["message"].get("content"))
+            elif "text" in first:
+                text = str(first["text"])
+            else:
+                text = str(first)
+        else:
+            text = str(first)
+
+        unit = degenerate_repetition(text)
+        if unit is not None:
+            if require_complete:
+                raise InferenceDegenerateError(self.backend.value, self.model, unit)
+            logger.warning(
+                "%s model %s returned degenerate repeated output (%r repeated to "
+                "the end); the result is not usable as an answer.",
+                self.backend.value,
+                self.model,
+                unit,
+            )
+        return text
 
 
 # Compatibility names for callers and serialized workflows from the oMLX-only

@@ -406,6 +406,17 @@ class TestWebSecurity:
         assert "video not found" in body["error"]
         assert not runner.busy()
 
+    def test_handler_errors_answer_500_instead_of_dropping_the_socket(self, server, monkeypatch):
+        """An exception escaping a handler leaves the client with no response
+        at all — the dashboard then shows nothing rather than the failure."""
+        def boom(params):
+            raise RuntimeError("model returned degenerate repeated output")
+
+        monkeypatch.setattr(runner, "search_now", boom)
+        status, body = post(server, "/api/search", {"query": "x", "run_slug": "y"})
+        assert status == 500
+        assert "degenerate" in body["error"]
+
     def test_unknown_routes_are_404(self, server):
         for path in ["/api/nope", "/../etc/passwd", "/secrets"]:
             with pytest.raises(urllib.error.HTTPError) as exc:
