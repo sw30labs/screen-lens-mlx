@@ -171,6 +171,19 @@ class TestWebAPI:
         assert snap["captions_preview"][0]["preview"].startswith("A terminal window")
         assert "transcript.md" in snap["outputs"]
 
+    def test_empty_chromadb_dir_is_not_an_embedded_run(self, server, data_root):
+        """ensure_dirs() makes chromadb/ up front, so directory existence would
+        report a vector DB — and label a still-captioning run "embedded"."""
+        (data_root / "chromadb").mkdir()
+        _, snap = get(server, "/api/run?slug=demo_20260101_101010")
+        assert snap["has_chromadb"] is False
+        assert snap["stage"] == "captioned"
+
+        (data_root / "chromadb" / "chroma.sqlite3").write_bytes(b"SQLite format 3\x00")
+        _, snap = get(server, "/api/run?slug=demo_20260101_101010")
+        assert snap["has_chromadb"] is True
+        assert snap["stage"] == "embedded"
+
     def test_unknown_run_is_404(self, server, data_root):
         with pytest.raises(urllib.error.HTTPError) as exc:
             get(server, "/api/run?slug=nope_20200101_000000")

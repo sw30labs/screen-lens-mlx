@@ -552,9 +552,11 @@ pre.doc {
           <div data-need="ingest">
             <label class="rf-label">Caption token budget</label>
             <input class="input" id="f-captiontokens" type="number" step="128" min="128" value="1500" />
-            <div class="hint">Max output tokens per caption. Leave empty for the config default (the
-              full context) — on a dense frame that lets the model run past the real content into a
-              repetition loop, costing tens of minutes per frame.</div>
+            <div class="hint">Max output tokens per caption. Watch Live Activity: a
+              "truncated the response at N (finish_reason=length)" warning means captions are being
+              cut off — raise this. Leave empty for the config default (the full context), but on a
+              dense frame that lets the model run past the real content into a repetition loop,
+              costing tens of minutes per frame.</div>
           </div>
           <div>
             <label class="rf-label">Vision model (captions / OCR)</label>

@@ -336,6 +336,16 @@ def discover_runs(data_dir: Path | str = "./data") -> list[dict[str, Any]]:
     return runs
 
 
+def _has_vector_store(folder: Path) -> bool:
+    """True only once ChromaDB has actually written a store.
+
+    ``ensure_dirs()`` creates an empty ``chromadb/`` at the start of every run,
+    so directory existence would report a vector DB before a single embedding
+    exists — and would label a still-captioning run "embedded".
+    """
+    return (folder / "chromadb" / "chroma.sqlite3").is_file()
+
+
 def _run_summary(folder: Path) -> dict[str, Any]:
     frames = _count_files(folder / "frames")
     captions = _count_files(folder / "captions", "caption_*.json")
@@ -343,9 +353,10 @@ def _run_summary(folder: Path) -> dict[str, Any]:
     outputs = sorted(
         p.name for p in (folder / "output").glob("*") if p.is_file()
     ) if (folder / "output").is_dir() else []
+    embedded = _has_vector_store(folder)
 
     if captions and frames:
-        stage = "captioned" if not (folder / "chromadb").is_dir() else "embedded"
+        stage = "embedded" if embedded else "captioned"
     elif ocr:
         stage = "transcribed"
     elif frames:
@@ -361,7 +372,7 @@ def _run_summary(folder: Path) -> dict[str, Any]:
         "captions": captions,
         "ocr": ocr,
         "outputs": outputs,
-        "has_chromadb": (folder / "chromadb").is_dir(),
+        "has_chromadb": embedded,
         "collection": f"screenlens_{base_slug(folder.name)}",
         "stage": stage,
         "modified": _folder_mtime(folder),
