@@ -94,7 +94,7 @@ Start oMLX on `http://127.0.0.1:8000/v1`, configure `MLX_*` or `OMLX_*` values i
 ./setup_and_run_macos.sh ingest "video.mov"
 ```
 
-The script creates a `screenlens` Conda environment with Python 3.11 and ffmpeg, installs the package in editable mode, preserves an existing `.env`, and defaults to the web command deck (`serve`). Set `SCREENLENS_CONDA_ENV` to choose another environment name. On Linux/ARM64 it exits with directions to the checked Spark helper so a generic pip install cannot replace CUDA 13 wheels with CPU wheels.
+The script creates a `screenlens` Conda environment with Python 3.11 and ffmpeg, installs the package in editable mode, preserves an existing `.env`, and defaults to the web command deck (`serve --restart`, so the deck it leaves running is the code it just installed; it refuses to replace a deck that is mid-job). Set `SCREENLENS_CONDA_ENV` to choose another environment name. On Linux/ARM64 it exits with directions to the checked Spark helper so a generic pip install cannot replace CUDA 13 wheels with CPU wheels.
 
 ### Manual development install
 
@@ -220,8 +220,15 @@ The transcribe path copies visible text rather than describing it. A live image 
 ```bash
 python -m src.cli serve                 # http://127.0.0.1:8760, opens a browser
 python -m src.cli serve --port 9000 --no-browser
+python -m src.cli serve --restart       # replace a deck already on that port
 python -m src.web                       # same thing without Typer
 ```
+
+Starting the deck twice is safe. When the port is already taken, `serve` asks
+`/api/health` who is there: a running deck means it opens the browser at that
+one and exits 0, anything else is left untouched. `--restart` stops the running
+deck first, and refuses while a pipeline job is in flight unless you add
+`--force` — a job is minutes-to-hours of model time.
 
 A local dashboard over every pipeline: run register, frame gallery served
 straight off disk, semantic search, pipeline control, and an artifact reader.

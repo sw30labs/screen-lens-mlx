@@ -340,6 +340,19 @@ def start_job(params: dict[str, Any]) -> tuple[str | None, str | None]:
             return None, f"video not found: {video}"
     if pipeline == "summarize" and not str(params.get("run_slug") or "").strip():
         return None, "run_slug is required for summarize"
+    if pipeline in ("reconstruct", "summarize"):
+        # Both rebuild from vision captions. A transcribe-only run has ocr/ but
+        # no captions/, so neither can succeed — say so here rather than after a
+        # job record has been opened. (reconstruct's all-folders path below
+        # already filters on captions.)
+        slug = str(params.get("run_slug") or "").strip()
+        folder = resolve_run(slug, str(params.get("data_dir") or "./data")) if slug else None
+        if folder is not None and not (folder / "captions" / "all_captions.json").is_file():
+            return None, (
+                f"{slug} has no captions — {pipeline} reads vision captions, so "
+                f"run ingest on this video first "
+                f"(a transcribe-only run has ocr/ but no captions/)"
+            )
 
     if not _BUSY.acquire(blocking=False):
         return None, "another job is still running — wait for it to finish"
@@ -554,6 +567,8 @@ def _run_summarize(params: dict[str, Any], config: ScreenLensConfig) -> dict[str
     _emit("stage", f"summarize {folder.name}")
 
     result = summarize_all_node({"config": config.model_dump()})
+    if result.get("error"):
+        return {"run_slug": folder.name, "error": result["error"]}
     summary = result.get("summary", "")
     (folder / "output").mkdir(parents=True, exist_ok=True)
     (folder / "output" / "summary.md").write_text(summary, encoding="utf-8")

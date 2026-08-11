@@ -113,6 +113,9 @@ class VerbatimOCR:
                 max_tokens=256,
                 temperature=0.0,
                 extra=self._extra,
+                # 256 tokens is enough to tell sight from a refusal, so any real
+                # frame trips finish_reason=length here by design.
+                expect_truncation=True,
             )
         except Exception as exc:
             raise RuntimeError(f"OCR probe call failed: {exc}") from exc

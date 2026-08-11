@@ -482,3 +482,40 @@ def test_wire_jpeg_is_opt_in_on_the_client():
         base_url="http://127.0.0.1:8000/v1", model="m", api_key=None,
     )
     assert default.wire_jpeg is False
+
+
+def test_probe_truncation_is_not_reported_as_a_problem(tmp_path, monkeypatch, caplog):
+    """The probe caps itself at 256 tokens, so a cut-off answer is expected —
+    warning about it puts a false alarm in the command deck's activity feed."""
+    import src.omlx_client as omlx_client
+    from PIL import Image
+    from src.config import OCRConfig
+    from src.ocr import VerbatimOCR
+
+    img_path = tmp_path / "frame.png"
+    Image.new("RGB", (4, 4), color="white").save(img_path)
+
+    class FakeResponse:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def read(self):
+            import json
+            return json.dumps({
+                "choices": [{
+                    "finish_reason": "length",
+                    "message": {"content": "def main():"},
+                }]
+            }).encode()
+
+    monkeypatch.setattr(omlx_client, "_urlopen", lambda req, timeout: FakeResponse())
+    ocr = VerbatimOCR(OCRConfig(model="Qwen3-VL-test"))
+
+    with caplog.at_level("WARNING"):
+        ocr.probe(str(img_path))
+    assert "truncated" not in caplog.text, "the probe's own cap is not a warning"
+
+    # A real frame hitting the cap is still worth shouting about.
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        ocr.ocr_frame(str(img_path))
+    assert "truncated the response at" in caplog.text

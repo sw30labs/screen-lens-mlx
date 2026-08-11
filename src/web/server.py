@@ -20,6 +20,10 @@ import errno
 import ipaddress
 import json
 import logging
+import threading
+import time
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,7 +32,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import runner
 
-__all__ = ["main", "serve", "DashboardHandler", "STATIC_DIR", "DEFAULT_PORT"]
+__all__ = ["main", "serve", "probe_deck", "stop_deck", "DashboardHandler",
+           "STATIC_DIR", "DEFAULT_PORT"]
 
 logger = logging.getLogger("screenlens.web.server")
 
@@ -190,7 +195,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _do_post(self) -> None:
         path = self.path.split("?", 1)[0]
-        if path not in ("/api/run", "/api/search"):
+        if path not in ("/api/run", "/api/search", "/api/shutdown"):
             self.send_error(404, "Not found")
             return
 
@@ -204,6 +209,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = self._read_json_body()
         if body is None:
             return  # _read_json_body already answered
+
+        if path == "/api/shutdown":
+            self._shutdown(bool(body.get("force")))
+            return
 
         if path == "/api/search":
             # Search runs inline, so a model failure surfaces here rather than
@@ -222,6 +231,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": error}, status=409 if "running" in error else 400)
         else:
             self._send_json({"job_id": job_id}, status=202)
+
+    def _shutdown(self, force: bool) -> None:
+        """Stop this deck. Refuses mid-job unless the caller insists.
+
+        A job is minutes-to-hours of model time and the runner serializes them,
+        so a relaunch must not take one out from under the operator by default.
+        """
+        if runner.busy() and not force:
+            self._send_json({
+                "error": (
+                    "a pipeline job is running; retry with force to stop anyway"
+                ),
+                "busy": True,
+                "active_job_id": runner.active_job_id(),
+                "current": runner.current_run(),
+            }, status=409)
+            return
+        self._send_json({"stopping": True, "forced": force})
+        # serve_forever() runs on another thread; shutdown() blocks until it
+        # exits, so it cannot be called from this handler thread.
+        threading.Thread(target=self.server.shutdown, daemon=True).start()
 
     def _read_json_body(self) -> dict[str, Any] | None:
         content_type = self.headers.get("Content-Type", "").split(";", 1)[0].lower()
@@ -304,37 +334,129 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return
 
 
+def probe_deck(host: str, port: int, timeout: float = 2.0) -> dict[str, Any] | None:
+    """Return the health payload if a ScreenLens deck answers on host:port."""
+    try:
+        with urllib.request.urlopen(
+            f"http://{host}:{port}/api/health", timeout=timeout
+        ) as response:
+            payload = json.loads(response.read(MAX_REQUEST_BYTES))
+    except Exception:
+        return None
+    if isinstance(payload, dict) and payload.get("ok") and "pipelines" in payload:
+        return payload
+    return None
+
+
+def stop_deck(
+    host: str, port: int, *, force: bool = False, timeout: float = 10.0
+) -> str | None:
+    """Ask a running deck to stop. Returns ``None`` on success, else the reason."""
+    request = urllib.request.Request(
+        f"http://{host}:{port}/api/shutdown",
+        data=json.dumps({"force": force}).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout):
+            return None
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return ("that deck predates --restart; stop it with Ctrl-C in the "
+                    "terminal it is running in")
+        with contextlib.suppress(Exception):
+            return json.loads(exc.read()).get("error") or f"HTTP {exc.code}"
+        return f"the running deck answered HTTP {exc.code}"
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def _bind(host: str, port: int) -> ThreadingHTTPServer | None:
+    """Bind the dashboard, or ``None`` when the port is taken."""
+    try:
+        return ThreadingHTTPServer((host, port), DashboardHandler)
+    except OSError as exc:
+        if exc.errno == errno.EADDRINUSE:
+            return None
+        raise
+
+
+def _bind_after_release(
+    host: str, port: int, attempts: int = 40, delay: float = 0.25
+) -> ThreadingHTTPServer | None:
+    """Bind once the stopped deck has actually let go of the port."""
+    for _ in range(attempts):
+        server = _bind(host, port)
+        if server is not None:
+            return server
+        time.sleep(delay)
+    return None
+
+
+def _open_browser(url: str, enabled: bool) -> None:
+    if enabled:
+        with contextlib.suppress(Exception):
+            webbrowser.open(url)
+
+
 def serve(
     *,
     host: str = "127.0.0.1",
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
     query: str = "",
+    restart: bool = False,
+    force: bool = False,
 ) -> None:
-    """Start the dashboard server (blocks until Ctrl-C)."""
+    """Start the dashboard server (blocks until Ctrl-C).
+
+    Idempotent: if a deck already holds the port, this attaches to it (opens the
+    browser there and returns 0) instead of failing. ``restart`` stops that deck
+    first, and only ``force`` will do so while it is running a job.
+    """
     if not _is_loopback_bind_host(host):
         raise SystemExit(
             "--host must be a loopback address or localhost; the command deck "
             "starts jobs and reads frames off disk, so it is local-only by design"
         )
 
-    try:
-        server = ThreadingHTTPServer((host, port), DashboardHandler)
-    except OSError as exc:
-        if exc.errno == errno.EADDRINUSE:
-            print(f"Port {port} is already in use — a command deck is most likely")
-            print(f"already running at http://{host}:{port}")
-            print(f"(or pick another port: screenlens serve --port {port + 1})")
-            raise SystemExit(1) from None
-        raise
-
     url = f"http://{host}:{port}"
     if query:
         url = f"{url}/?{query.lstrip('?')}"
+
+    server = _bind(host, port)
+    if server is None:
+        health = probe_deck(host, port)
+        if health is None:
+            print(f"Port {port} is already in use, and whatever holds it is not")
+            print("a ScreenLens command deck — leaving it alone.")
+            print(f"(pick another port: screenlens serve --port {port + 1})")
+            raise SystemExit(1)
+
+        if not restart:
+            print(f"A ScreenLens command deck is already running at {url}")
+            if health.get("busy"):
+                print(f"It is running a job ({health.get('active_job_id')}).")
+            print("(replace it with: screenlens serve --restart)")
+            _open_browser(url, open_browser)
+            return
+
+        refusal = stop_deck(host, port, force=force)
+        if refusal:
+            print(f"Could not restart the deck at {url}: {refusal}")
+            if not force:
+                print("(stop it anyway with: screenlens serve --restart --force)")
+            raise SystemExit(1)
+        print(f"Stopped the command deck already running at {url}")
+
+        server = _bind_after_release(host, port)
+        if server is None:
+            print(f"Port {port} did not free up after the running deck stopped.")
+            raise SystemExit(1)
+
     print(f"ScreenLens command deck → {url}  (Ctrl+C to stop)")
-    if open_browser:
-        with contextlib.suppress(Exception):
-            webbrowser.open(url)
+    _open_browser(url, open_browser)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -350,8 +472,17 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--no-browser", action="store_true", help="Do not open a browser tab on start."
     )
+    parser.add_argument(
+        "--restart", action="store_true",
+        help="Stop a command deck already on this port, then start a fresh one.",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="With --restart, stop the running deck even mid-job.",
+    )
     args = parser.parse_args(argv)
-    serve(host=args.host, port=args.port, open_browser=not args.no_browser)
+    serve(host=args.host, port=args.port, open_browser=not args.no_browser,
+          restart=args.restart, force=args.force)
 
 
 if __name__ == "__main__":

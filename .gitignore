@@ -50,4 +50,5 @@ input/
 
 # Misc
 .env
+.env.bak
 *.log

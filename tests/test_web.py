@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import json
 import re
+import socket
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -23,7 +25,15 @@ from pathlib import Path
 import pytest
 
 from src.web import runner
-from src.web.server import STATIC_DIR, DashboardHandler, _is_loopback_bind_host
+from src.web import server as web_server
+from src.web.server import (
+    STATIC_DIR,
+    DashboardHandler,
+    _is_loopback_bind_host,
+    probe_deck,
+    serve,
+    stop_deck,
+)
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -53,6 +63,17 @@ def _wait_idle(timeout: float = 10.0) -> None:
     deadline = time.time() + timeout
     while runner.busy() and time.time() < deadline:
         time.sleep(0.02)
+
+
+def _hostport(base: str) -> tuple[str, int]:
+    parsed = urllib.parse.urlsplit(base)
+    return parsed.hostname, parsed.port
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
 
 
 def get(base: str, path: str):
@@ -123,7 +144,7 @@ class TestWebAssets:
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         called = set(re.findall(r'["`/]api/([a-z]+)', html))
         served = {"health", "roles", "backend", "runs", "run", "artifact",
-                  "frame", "videos", "events", "jobs", "search"}
+                  "frame", "videos", "events", "jobs", "search", "shutdown"}
         assert called <= served, f"SPA calls endpoints the server does not serve: {called - served}"
 
     def test_index_serves_over_http(self, server):
@@ -398,6 +419,26 @@ class TestWebSecurity:
         assert "must be one of" in body["error"]
         assert not runner.busy()
 
+    @pytest.mark.parametrize("pipeline", ["reconstruct", "summarize"])
+    def test_caption_reading_pipelines_refuse_a_transcribe_only_run(
+        self, pipeline, server, data_root
+    ):
+        """A transcribe run has ocr/ but no captions/. Both pipelines read
+        captions, so the deck must say so instead of opening a doomed job —
+        summarize used to save its own failure text as output/summary.md."""
+        ocr_only = data_root.parent / "spoken_20260811_120000"
+        (ocr_only / "ocr").mkdir(parents=True)
+        (ocr_only / "ocr" / "all_ocr.json").write_text("[]")
+
+        status, body = post(server, "/api/run", {
+            "pipeline": pipeline, "run_slug": ocr_only.name, "data_dir": str(data_root.parent),
+        })
+        assert status == 400
+        assert "no captions" in body["error"]
+        assert "ingest" in body["error"]
+        assert not runner.busy()
+        assert not (ocr_only / "output" / "summary.md").exists()
+
     def test_missing_video_is_refused_before_starting_a_job(self, server):
         status, body = post(
             server, "/api/run", {"pipeline": "ingest", "video_path": "/nope/missing.mov"}
@@ -423,3 +464,80 @@ class TestWebSecurity:
                 urllib.request.urlopen(server + path, timeout=10)
             assert exc.value.code == 404, path
         assert post(server, "/api/nope", {})[0] == 404
+
+
+# ── single instance ─────────────────────────────────────────────────────────
+
+class TestSingleInstance:
+    """Relaunching the deck must not fail, and must not kill a job mid-run."""
+
+    def test_probe_deck_identifies_a_running_deck(self, server):
+        health = probe_deck(*_hostport(server))
+        assert health is not None
+        assert health["ok"] is True
+        assert "ingest" in health["pipelines"]
+
+    def test_probe_deck_is_none_when_nothing_listens(self):
+        assert probe_deck("127.0.0.1", _free_port(), timeout=1.0) is None
+
+    def test_serve_attaches_to_a_running_deck(self, server, monkeypatch):
+        """The launcher runs `serve` on every start; a deck already up is the
+        answer to that request, not an error."""
+        opened: list[str] = []
+        monkeypatch.setattr(web_server.webbrowser, "open", opened.append)
+        host, port = _hostport(server)
+
+        serve(host=host, port=port, open_browser=True)  # returns, no SystemExit
+
+        assert opened == [f"http://{host}:{port}"]
+        assert probe_deck(host, port) is not None, "attaching must not stop it"
+
+    def test_serve_leaves_a_foreign_port_holder_alone(self, monkeypatch):
+        opened: list[str] = []
+        monkeypatch.setattr(web_server.webbrowser, "open", opened.append)
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            sock.listen(1)
+            port = sock.getsockname()[1]
+            with pytest.raises(SystemExit) as exc:
+                serve(host="127.0.0.1", port=port, open_browser=True)
+        assert exc.value.code == 1
+        assert opened == []
+
+    def test_shutdown_is_refused_while_a_job_runs(self, server, monkeypatch):
+        """A running pipeline is minutes-to-hours of model time."""
+        monkeypatch.setattr(runner, "busy", lambda: True)
+        status, body = post(server, "/api/shutdown", {})
+        assert status == 409
+        assert "force" in body["error"]
+        assert probe_deck(*_hostport(server)) is not None
+
+    def test_stop_deck_reports_the_refusal_then_honours_force(self, server, monkeypatch):
+        monkeypatch.setattr(runner, "busy", lambda: True)
+        host, port = _hostport(server)
+
+        refusal = stop_deck(host, port)
+        assert refusal is not None and "force" in refusal
+
+        assert stop_deck(host, port, force=True) is None
+        _assert_stops_answering(host, port)
+
+    def test_shutdown_stops_an_idle_deck(self, server):
+        host, port = _hostport(server)
+        assert stop_deck(host, port) is None
+        _assert_stops_answering(host, port)
+
+    def test_shutdown_is_loopback_only(self, server, monkeypatch):
+        monkeypatch.setattr(web_server, "_client_is_loopback", lambda handler: False)
+        status, body = post(server, "/api/shutdown", {})
+        assert status == 403
+        assert "local" in body["error"]
+
+
+def _assert_stops_answering(host: str, port: int, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if probe_deck(host, port, timeout=0.5) is None:
+            return
+        time.sleep(0.1)
+    pytest.fail("the deck kept answering after it was told to stop")

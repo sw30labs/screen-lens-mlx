@@ -827,8 +827,11 @@ async function fillModelSelects() {
   const opt = (list, current, note) => {
     const seen = new Set();
     const items = [];
-    if (current && !list.includes(current)) items.push([current, current + " (configured)"]);
     for (const m of list) if (!seen.has(m)) { seen.add(m); items.push([m, m + note(m)]); }
+    // A configured model the endpoint does not serve is still worth showing —
+    // but last, and never preselected below, so a freshly loaded page cannot
+    // submit a job that 404s on the model id (e.g. a stale OMLX_MODEL=default).
+    if (current && !list.includes(current)) items.push([current, current + " (configured — not served)"]);
     return items.map(([v, label]) => `<option value="${esc(v)}">${esc(label)}</option>`).join("");
   };
   const vision = $("#f-vision"), text = $("#f-text");
@@ -837,8 +840,8 @@ async function fillModelSelects() {
   // aborts on a text-only pick anyway, so don't let the UI suggest one.
   vision.innerHTML = opt(MODELS.vision, curV, () => " (vision)");
   text.innerHTML = opt(MODELS.all, curT, m => MODELS.vision.includes(m) ? " (vision)" : " (text)");
-  if (curV) vision.value = curV;
-  if (curT) text.value = curT;
+  if (curV && MODELS.vision.includes(curV)) vision.value = curV;
+  if (curT && MODELS.all.includes(curT)) text.value = curT;
 }
 
 /* ── runs ── */

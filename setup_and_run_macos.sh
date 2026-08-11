@@ -95,7 +95,11 @@ log "Installing ScreenLens in editable mode"
     python -m pip install --editable "${REPO_ROOT}"
 
 if [[ $# -eq 0 ]]; then
-    set -- serve
+    # This script has just reinstalled the package, so attaching to a deck that
+    # predates the install would serve stale code (an old in-memory client with
+    # newly-imported pipeline modules). --restart is safe: it refuses while a
+    # pipeline job is running unless --force is added.
+    set -- serve --restart
 fi
 
 log "Launching ScreenLens"

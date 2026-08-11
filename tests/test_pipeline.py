@@ -687,7 +687,7 @@ class TestCaptioner:
         captioner = OMLXCaptioner(config)
         captured = {}
 
-        def fake_post(payload):
+        def fake_post(payload, **kwargs):
             captured.update(payload)
             return "visible caption"
 
@@ -1673,3 +1673,21 @@ class TestSummaryCache:
         assert first["summary"] == second["summary"] == "whole-video summary"
         assert calls["n"] == 1
         assert (tmp_path / "summary_cache.json").exists()
+
+
+def test_summarize_all_node_errors_instead_of_summarizing_nothing(tmp_path):
+    """Returning the failure text as the summary made the deck write it to
+    output/summary.md and report the job done — a 39-byte 'summary'."""
+    from src import pipeline
+    from src.config import ScreenLensConfig
+
+    config = ScreenLensConfig()
+    config.data_dir = tmp_path / "transcribe_only"
+    (config.data_dir / "ocr").mkdir(parents=True)
+
+    result = pipeline.summarize_all_node({"config": config.model_dump()})
+
+    assert result["stage"] == "error"
+    assert result["summary"] == ""
+    assert "no captions" in result["error"]
+    assert "ingest" in result["error"]

@@ -618,6 +618,7 @@ class OpenAICompatibleClient:
         temperature: float | None = None,
         extra: dict[str, Any] | None = None,
         require_complete: bool = False,
+        expect_truncation: bool = False,
     ) -> str:
         if images:
             validate_vision_model(self.model)
@@ -670,11 +671,11 @@ class OpenAICompatibleClient:
         # etc.). Both the bundled vLLM recipe and current oMLX accept these.
         if extra:
             payload.update({k: v for k, v in extra.items() if v is not None})
-        if require_complete:
-            return strip_thinking(
-                self._post_chat(payload, require_complete=True)
-            )
-        return strip_thinking(self._post_chat(payload))
+        return strip_thinking(self._post_chat(
+            payload,
+            require_complete=require_complete,
+            expect_truncation=expect_truncation,
+        ))
 
     def _tokenize_url(self) -> str:
         """Return vLLM's root-level tokenization endpoint URL."""
@@ -780,6 +781,7 @@ class OpenAICompatibleClient:
         *,
         allow_context_retry: bool = True,
         require_complete: bool = False,
+        expect_truncation: bool = False,
     ) -> str:
         headers = {"Content-Type": "application/json"}
         if self.api_key:
@@ -804,6 +806,7 @@ class OpenAICompatibleClient:
                         retry_payload,
                         allow_context_retry=False,
                         require_complete=require_complete,
+                        expect_truncation=expect_truncation,
                     )
             hint = ""
             if exc.code == 401:
@@ -847,13 +850,16 @@ class OpenAICompatibleClient:
                     self.backend.value,
                     completion_limit,
                 )
-            logger.warning(
-                "%s truncated the response at %s (finish_reason=length); "
-                "the returned text may be incomplete. Reduce the prompt or "
-                "increase the completion budget within the model context.",
-                self.backend.value,
-                completion_limit,
-            )
+            if not expect_truncation:
+                # A deliberately capped call (the OCR capability probe) is
+                # supposed to come back cut off; only warn when it is a surprise.
+                logger.warning(
+                    "%s truncated the response at %s (finish_reason=length); "
+                    "the returned text may be incomplete. Reduce the prompt or "
+                    "increase the completion budget within the model context.",
+                    self.backend.value,
+                    completion_limit,
+                )
         if isinstance(first, dict):
             if "message" in first and isinstance(first["message"], dict):
                 text = _message_text(first["message"].get("content"))

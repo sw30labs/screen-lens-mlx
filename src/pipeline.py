@@ -513,7 +513,17 @@ def summarize_all_node(state: ScreenLensState) -> dict:
             with open(captions_file) as f:
                 captioned = _json.load(f)
         else:
-            return {"summary": "No captions found. Run ingestion first.", "stage": "summarized"}
+            # An error, not a summary: returning this as the summary makes
+            # callers save the failure text as output/summary.md and call it done.
+            return {
+                "error": (
+                    f"no captions at {captions_file} — summarize reads vision "
+                    f"captions, so run ingest on this video first "
+                    f"(a transcribe-only run has ocr/ but no captions/)"
+                ),
+                "summary": "",
+                "stage": "error",
+            }
 
     print(f"\n{'='*60}")
     print(f"[SUMMARIZE] Full-video summary from {len(captioned)} frames")

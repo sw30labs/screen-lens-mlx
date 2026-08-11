@@ -527,6 +527,10 @@ def summarize(
     result = summarize_all_node(state)
     total_time = time.time() - t0
 
+    if result.get("error"):
+        console.print(f"[red]Error: {result['error']}[/red]")
+        raise typer.Exit(1)
+
     if result.get("summary"):
         console.print(Panel(
             result["summary"],
@@ -999,10 +1003,13 @@ def serve(
     host: str = typer.Option("127.0.0.1", help="Bind address (loopback only)"),
     no_browser: bool = typer.Option(False, "--no-browser", help="Do not open a browser tab"),
     view: Optional[str] = typer.Option(None, help="Open straight to a view: overview, runs, frames, search, pipeline, artifacts"),
+    restart: bool = typer.Option(False, "--restart", help="Stop a command deck already on this port, then start a fresh one"),
+    force: bool = typer.Option(False, "--force", help="With --restart, stop the running deck even mid-job"),
 ):
     """Launch the web command deck — a local dashboard over every pipeline.
 
     Binds loopback-only by design: it starts jobs and reads frames off disk.
+    If a deck already holds the port, this opens that one instead of failing.
     """
     from .web.server import serve as serve_dashboard
 
@@ -1018,6 +1025,8 @@ def serve(
         port=port,
         open_browser=not no_browser,
         query=f"#{view}" if view else "",
+        restart=restart,
+        force=force,
     )
 
 
