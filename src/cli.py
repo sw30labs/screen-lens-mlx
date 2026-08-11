@@ -32,7 +32,14 @@ from .config import (
 )
 from .omlx_client import resolve_inference_model, resolve_llm_model, resolve_ocr_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
-from .session import apply_video_slug, load_config
+from .session import (
+    apply_video_slug,
+    extraction_meta_matches,
+    find_reusable_run,
+    load_config,
+    reuse_video_run,
+    transcribe_run_matches,
+)
 
 app = typer.Typer(
     name="screenlens",
@@ -49,10 +56,31 @@ DEFAULT_DEVICE = default_embedding_device()
 DEFAULT_BATCH_SIZE = default_inference_concurrency()
 
 
-# Config/slug plumbing is shared with the TUI and the web command deck so a run
-# started from any front end lands in the same ./data/<slug>/ layout.
+# Config/slug plumbing is shared with the web command deck so a run started
+# from either front end lands in the same ./data/<slug>/ layout.
 _load_config = load_config
 _apply_video_slug = apply_video_slug
+
+
+def _prepare_video_run(
+    config: ScreenLensConfig,
+    video: Path,
+    *,
+    fresh: bool,
+    required: str,
+    matches,
+) -> tuple[str, bool]:
+    """Pick the run folder for a video: reuse the newest matching prior run.
+
+    Falls back to a fresh timestamped slug when there is nothing to reuse,
+    when the prior run's metadata belongs to a different video/config, or when
+    ``fresh`` was requested. Returns ``(slug, reused)``.
+    """
+    if not fresh:
+        reuse_dir = find_reusable_run(config, video, required)
+        if reuse_dir is not None and matches(reuse_dir, video, config):
+            return reuse_video_run(config, video, reuse_dir), True
+    return apply_video_slug(config, video), False
 
 
 def _apply_captioning_options(
@@ -119,9 +147,14 @@ def ingest(
     batch_size: int = typer.Option(DEFAULT_BATCH_SIZE, help="Concurrent caption requests"),
     # Other
     device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP: mps, cuda, cpu"),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore prior runs of this video and start a new run folder"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
-    """Ingest a video: extract keyframes, generate captions, create embeddings."""
+    """Ingest a video: extract keyframes, generate captions, create embeddings.
+
+    Re-running the same video resumes the newest prior run instead of paying
+    for extraction, captions, and embeddings again (use --fresh to start over).
+    """
     video = Path(video_path)
     if not video.exists():
         console.print(f"[red]Error: Video file not found: {video_path}[/red]")
@@ -147,8 +180,15 @@ def ingest(
     # Embedding
     config.embedding.device = device
 
-    # Per-video slugged data directory (consistent with `batch`)
-    slug = _apply_video_slug(config, video)
+    # Per-video data directory: resume the newest prior run of this video when
+    # its extraction config matches, otherwise mint a fresh slug (as `batch`).
+    slug, reused = _prepare_video_run(
+        config, video, fresh=fresh,
+        required="frames/frames_meta.json",
+        matches=extraction_meta_matches,
+    )
+    if reused:
+        console.print(f"[dim]Resuming run {slug} — completed stages are skipped (--fresh to start over)[/dim]")
 
     # Display config
     model_display = _caption_model_display(config)
@@ -407,6 +447,7 @@ def run(
         help="Optional inference API key",
     ),
     device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP"),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore prior runs of this video and start a new run folder"),
 ):
     """Ingest a video AND search it in one shot."""
     video = Path(video_path)
@@ -425,8 +466,12 @@ def run(
     )
     config.embedding.device = device
 
-    # Per-video slugged data directory (consistent with `ingest` / `batch`)
-    _apply_video_slug(config, video)
+    # Per-video data directory (resume semantics consistent with `ingest`)
+    _prepare_video_run(
+        config, video, fresh=fresh,
+        required="frames/frames_meta.json",
+        matches=extraction_meta_matches,
+    )
 
     pipeline = build_full_graph()
     state = {
@@ -520,6 +565,7 @@ def batch(
     batch_size: int = typer.Option(DEFAULT_BATCH_SIZE, help="Concurrent caption requests"),
     # Other
     device: str = typer.Option(DEFAULT_DEVICE, help="Device for CLIP: mps, cuda, cpu"),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore prior runs and start new run folders"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Batch-ingest all videos in a folder."""
@@ -567,8 +613,14 @@ def batch(
         )
         config.embedding.device = device
 
-        # Per-video slugged data directory (shared with `ingest` / `run`)
-        _apply_video_slug(config, video)
+        # Per-video data directory (resume semantics shared with `ingest`/`run`)
+        slug, reused = _prepare_video_run(
+            config, video, fresh=fresh,
+            required="frames/frames_meta.json",
+            matches=extraction_meta_matches,
+        )
+        if reused:
+            console.print(f"[dim]  Resuming run {slug}[/dim]")
 
         pipeline = build_ingest_graph()
         initial_state = {
@@ -816,6 +868,7 @@ def transcribe(
     sample_fps: float = typer.Option(2.0, help="Frames/sec to sample before dedup"),
     cleanup: bool = typer.Option(False, "--cleanup", help="Run the optional LLM seam/indent cleanup pass (default: off — the raw stitched transcript is already verbatim)"),
     deterministic: bool = typer.Option(False, "--deterministic", help="Also run Apple Vision backstop (macOS only)"),
+    fresh: bool = typer.Option(False, "--fresh", help="Ignore cached OCR from prior runs of this video"),
     config_file: Optional[str] = typer.Option(None, help="Path to config JSON file"),
 ):
     """Verbatim transcription: faithfully reconstruct the text/code shown in a recording.
@@ -849,7 +902,13 @@ def transcribe(
     config.reconstruction.enabled = cleanup
     config.ocr.deterministic_backstop = deterministic
 
-    slug = _apply_video_slug(config, video)
+    slug, reused = _prepare_video_run(
+        config, video, fresh=fresh,
+        required="ocr",
+        matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
+    )
+    if reused:
+        console.print(f"[dim]Resuming run {slug} — cached OCR is reused (--fresh to start over)[/dim]")
 
     from .omlx_client import resolve_ocr_model, resolve_llm_model
     console.print(Panel.fit(
@@ -932,19 +991,6 @@ def models(
         table.add_row(mid, cap)
     console.print(table)
     console.print("[dim]Use a vision model for `transcribe --ocr-model`; a text model is fine for cleanup.[/dim]")
-
-
-@app.command()
-def tui(
-    config_file: Optional[str] = typer.Argument(
-        None,
-        help="Optional JSON config file to load when the TUI starts",
-    ),
-):
-    """Launch the Textual/Rich terminal GUI."""
-    from .tui import run_tui
-
-    raise typer.Exit(run_tui(config_file))
 
 
 @app.command()

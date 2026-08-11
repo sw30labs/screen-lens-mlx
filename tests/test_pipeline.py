@@ -213,32 +213,6 @@ class TestOMLXClient:
         with pytest.raises(ValueError, match="text-only model"):
             client.chat("system", "describe", images=["missing.jpg"])
 
-    def test_tui_hides_known_text_only_omlx_models(self):
-        from src.tui import _omlx_model_options
-
-        options = _omlx_model_options(
-            [
-                "MiniMax-M2.7",
-                "deepseek-ai-DeepSeek-V4-Flash-8bit",
-                "gpt-oss-120b-MXFP4-Q8",
-            ],
-            "deepseek-ai-DeepSeek-V4-Flash-8bit",
-        )
-
-        assert options == []
-
-    def test_tui_summary_supports_ollama_backend(self):
-        from src.config import CaptionBackend, ScreenLensConfig
-        from src.tui import _summary_rows
-
-        config = ScreenLensConfig()
-        config.captioning.backend = CaptionBackend.ollama
-        rows = dict(_summary_rows(config, None))
-
-        assert rows["Inference URL"] == config.captioning.ollama_base_url
-        assert rows["Inference key"] == "n/a"
-        assert rows["Reconstruct timeout"] == "1800s"
-
     def test_vllm_defaults_and_legacy_env_isolation(self, monkeypatch):
         from src.config import CaptionBackend, CaptioningConfig, OCRConfig, ReconstructionConfig
         from src.omlx_client import (
@@ -910,7 +884,7 @@ class TestPipeline:
         graph = build_full_graph()
         assert graph is not None
 
-    def test_search_summary_uses_selected_vllm_client(self, monkeypatch):
+    def test_search_summary_uses_selected_vllm_client(self, tmp_path, monkeypatch):
         import src.pipeline as pipeline
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
@@ -928,6 +902,8 @@ class TestPipeline:
 
         monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
         config = ScreenLensConfig()
+        # Isolate the summary cache from any real ./data run folder.
+        config.vector_db.persist_directory = str(tmp_path / "chromadb")
         config.captioning.backend = CaptionBackend.vllm
         # Summaries run on the TEXT role, so it is the reconstruction backend
         # that decides the client (both are vLLM on Spark).
@@ -949,7 +925,7 @@ class TestPipeline:
             "chat_template_kwargs": {"enable_thinking": False},
         }
 
-    def test_summary_refuses_to_present_degenerate_output_as_an_answer(self, monkeypatch):
+    def test_summary_refuses_to_present_degenerate_output_as_an_answer(self, tmp_path, monkeypatch):
         """A summary is shown to the user and written to disk; a model stuck in
         a repetition loop must not have its output pass for one."""
         import src.pipeline as pipeline
@@ -968,6 +944,8 @@ class TestPipeline:
 
         monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
         config = ScreenLensConfig()
+        # Isolate the summary cache from any real ./data run folder.
+        config.vector_db.persist_directory = str(tmp_path / "chromadb")
         config.captioning.backend = CaptionBackend.omlx
         config.reconstruction.backend = InferenceBackend.omlx
 
@@ -1339,3 +1317,359 @@ class TestPipeline:
         assert direct.vllm_api_key == "direct-key"
         assert direct.vllm_timeout_seconds == config.reconstruction.timeout_seconds
         assert direct.max_tokens == config.reconstruction.max_tokens
+
+
+class TestRunReuse:
+    """Run-folder reuse helpers shared by the CLI and the web command deck."""
+
+    @staticmethod
+    def _write_frames_meta(run, video, config, frames):
+        import json
+        (run / "frames").mkdir(parents=True, exist_ok=True)
+        meta = {
+            "video": str(video.resolve()),
+            "video_size": video.stat().st_size,
+            "extraction": config.frame_extraction.model_dump(mode="json"),
+            "frames": frames,
+        }
+        (run / "frames" / "frames_meta.json").write_text(json.dumps(meta))
+
+    def test_find_reusable_run_picks_newest_with_marker(self, tmp_path):
+        from src.config import ScreenLensConfig
+        from src.session import find_reusable_run
+
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        for name in ("demo_20260101_000000", "demo_20260102_000000",
+                     "demo_20260103_000000", "other_20260104_000000"):
+            (tmp_path / name).mkdir()
+        (tmp_path / "demo_20260101_000000" / "ocr").mkdir()
+        (tmp_path / "demo_20260102_000000" / "ocr").mkdir()
+
+        found = find_reusable_run(config, tmp_path / "demo.mov", "ocr")
+        assert found == tmp_path / "demo_20260102_000000"
+        assert find_reusable_run(config, tmp_path / "missing.mov", "ocr") is None
+
+    def test_reuse_video_run_keeps_stem_collection(self, tmp_path):
+        from src.config import ScreenLensConfig
+        from src.session import reuse_video_run
+
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        run = tmp_path / "demo_20260102_000000"
+        run.mkdir()
+
+        slug = reuse_video_run(config, tmp_path / "demo.mov", run)
+        assert slug == run.name
+        assert config.data_dir == run
+        assert config.vector_db.persist_directory == str(run / "chromadb")
+        assert config.vector_db.collection_name == "screenlens_demo"
+
+    def test_extraction_meta_matches_guards_video_and_config(self, tmp_path):
+        from src.config import ExtractionStrategy, ScreenLensConfig
+        from src.session import extraction_meta_matches
+
+        video = tmp_path / "demo.mov"
+        video.write_bytes(b"x" * 123)
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        run = tmp_path / "demo_20260102_000000"
+        self._write_frames_meta(run, video, config, [])
+
+        assert extraction_meta_matches(run, video, config)
+
+        config.frame_extraction.strategy = ExtractionStrategy.fixed_fps
+        assert not extraction_meta_matches(run, video, config)
+        config.frame_extraction.strategy = ExtractionStrategy.keyframe
+
+        video.write_bytes(b"y" * 124)
+        assert not extraction_meta_matches(run, video, config)
+        assert not extraction_meta_matches(tmp_path / "no_such_run", video, config)
+
+    def test_load_cached_frames_requires_frame_files(self, tmp_path):
+        from src.config import ScreenLensConfig
+        from src.session import load_cached_frames
+
+        video = tmp_path / "demo.mov"
+        video.write_bytes(b"vid")
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        run = tmp_path / "demo_20260102_000000"
+        frame_path = run / "frames" / "frame_000000.jpg"
+        frames = [{"frame_id": 0, "timestamp": 0.0, "path": str(frame_path)}]
+        self._write_frames_meta(run, video, config, frames)
+
+        assert load_cached_frames(run, video, config) is None  # image missing
+        frame_path.write_bytes(b"jpg")
+        assert load_cached_frames(run, video, config) == frames
+
+    def test_transcribe_run_matches(self, tmp_path):
+        import json
+        from src.session import transcribe_run_matches
+
+        video = tmp_path / "demo.mov"
+        video.write_bytes(b"vid")
+        run = tmp_path / "demo_20260102_000000"
+        run.mkdir()
+        assert transcribe_run_matches(run, video)  # no meta yet → reusable
+
+        out = run / "output"
+        out.mkdir()
+        (out / "transcribe_meta.json").write_text(json.dumps(
+            {"video": str(video.resolve()), "video_size": video.stat().st_size}))
+        assert transcribe_run_matches(run, video)
+
+        video.write_bytes(b"longer video bytes")
+        assert not transcribe_run_matches(run, video)
+
+        (out / "transcribe_meta.json").write_text(json.dumps(
+            {"video": str((tmp_path / "other.mov").resolve())}))
+        assert not transcribe_run_matches(run, video)
+
+    def test_ingest_node_reuses_cached_extraction(self, tmp_path, monkeypatch):
+        import src.pipeline as pipeline
+        from src.config import ScreenLensConfig
+
+        video = tmp_path / "demo.mov"
+        video.write_bytes(b"vid")
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path / "demo_20260102_000000"
+        frame_path = config.data_dir / "frames" / "frame_000000.jpg"
+        frames = [{"frame_id": 0, "timestamp": 0.0, "timestamp_str": "00:00:00.000",
+                   "path": str(frame_path), "width": 4, "height": 4}]
+        self._write_frames_meta(config.data_dir, video, config, frames)
+        frame_path.write_bytes(b"jpg")
+
+        monkeypatch.setattr(pipeline, "get_video_metadata", lambda *a: {"mock": True})
+
+        def _no_extract(*a, **k):
+            raise AssertionError("extract_frames must not run on a meta cache hit")
+
+        monkeypatch.setattr(pipeline, "extract_frames", _no_extract)
+        result = pipeline.ingest_node(
+            {"video_path": str(video), "config": config.model_dump()})
+        assert result["num_frames"] == 1
+        assert result["frames_meta"] == frames
+        assert result["stage"] == "ingested"
+
+    def test_embed_node_skips_populated_store(self, tmp_path, monkeypatch):
+        import numpy as np
+        import src.pipeline as pipeline
+        from src.config import ScreenLensConfig
+        from src.vector_store import ScreenLensVectorStore
+
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        config.vector_db.persist_directory = str(tmp_path / "chromadb")
+        config.vector_db.collection_name = "test_embed_reuse"
+
+        frames = [{"frame_id": i, "timestamp": float(i), "timestamp_str": f"00:00:0{i}.000",
+                   "path": f"/tmp/f{i}.jpg", "width": 1, "height": 1, "caption": f"c{i}"}
+                  for i in range(2)]
+        store = ScreenLensVectorStore(config.vector_db)
+        store.add_frames(frames, np.random.randn(2, 512).astype(np.float32))
+
+        class _BombEmbedder:
+            def __init__(self, *a, **k):
+                raise AssertionError("CLIP must not load when the store is complete")
+
+        monkeypatch.setattr(pipeline, "CLIPEmbedder", _BombEmbedder)
+        result = pipeline.embed_node(
+            {"captioned_frames": frames, "config": config.model_dump()})
+        assert result["stage"] == "embedded"
+        assert result["embeddings_shape"] == [2]
+
+    def test_embed_node_rebuilds_partial_store(self, tmp_path, monkeypatch):
+        import numpy as np
+        import src.pipeline as pipeline
+        from src.config import ScreenLensConfig
+        from src.vector_store import ScreenLensVectorStore
+
+        config = ScreenLensConfig()
+        config.data_dir = tmp_path
+        config.vector_db.persist_directory = str(tmp_path / "chromadb")
+        config.vector_db.collection_name = "test_embed_partial"
+
+        frames = [{"frame_id": i, "timestamp": float(i), "timestamp_str": f"00:00:0{i}.000",
+                   "path": f"/tmp/f{i}.jpg", "width": 1, "height": 1, "caption": f"c{i}"}
+                  for i in range(2)]
+        store = ScreenLensVectorStore(config.vector_db)
+        store.add_frames(frames[:1], np.random.randn(1, 512).astype(np.float32))
+
+        class _FakeEmbedder:
+            def __init__(self, cfg):
+                pass
+
+            def embed_images(self, paths):
+                return np.random.randn(len(paths), 512).astype(np.float32)
+
+        monkeypatch.setattr(pipeline, "CLIPEmbedder", _FakeEmbedder)
+        result = pipeline.embed_node(
+            {"captioned_frames": frames, "config": config.model_dump()})
+        assert result["embeddings_shape"] == [2, 512]
+        assert ScreenLensVectorStore(config.vector_db).count() == 2
+
+
+# ── Round-2 efficiency: shared embedder + summary cache ─────────────────────
+
+class TestSharedEmbedder:
+    def test_shared_embedder_reuses_one_instance_per_model_and_device(self):
+        from src.config import EmbeddingConfig
+        from src.embedder import _SHARED, get_shared_embedder
+
+        _SHARED.clear()
+        try:
+            a = get_shared_embedder(EmbeddingConfig(device="cpu"))
+            b = get_shared_embedder(EmbeddingConfig(device="cpu"))
+            other = get_shared_embedder(EmbeddingConfig(device="mps"))
+            assert a is b
+            assert a is not other
+        finally:
+            _SHARED.clear()
+
+    def test_search_node_uses_the_shared_embedder(self, monkeypatch):
+        import numpy as np
+        import src.pipeline as pipeline
+        from src.config import ScreenLensConfig
+
+        calls = []
+
+        class _FakeEmbedder:
+            def embed_text(self, queries):
+                return np.ones((len(queries), 4), dtype=np.float32)
+
+        def fake_shared(config):
+            calls.append(config)
+            return _FakeEmbedder()
+
+        class _FakeStore:
+            def __init__(self, vector_config):
+                pass
+
+            def search_by_embedding(self, emb, top_k=10):
+                return [{
+                    "timestamp_str": "00:00:01.000",
+                    "caption": "A terminal.",
+                    "score": 0.9,
+                }]
+
+        monkeypatch.setattr(pipeline, "get_shared_embedder", fake_shared)
+        monkeypatch.setattr(pipeline, "ScreenLensVectorStore", _FakeStore)
+
+        config = ScreenLensConfig()
+        result = pipeline.search_node(
+            {"query": "terminal", "config": config.model_dump()})
+        assert len(calls) == 1
+        assert result["search_results"][0]["score"] == 0.9
+
+
+class TestSummaryCache:
+    def _config(self, tmp_path):
+        from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
+
+        config = ScreenLensConfig()
+        config.captioning.backend = CaptionBackend.omlx
+        config.reconstruction.backend = InferenceBackend.omlx
+        config.vector_db.persist_directory = str(tmp_path / "chromadb")
+        return config
+
+    def _state(self, config, query="what is shown?"):
+        return {
+            "query": query,
+            "search_results": [{
+                "timestamp_str": "00:00:01.000",
+                "caption": "A terminal.",
+                "score": 0.9,
+            }],
+            "config": config.model_dump(),
+        }
+
+    def test_summarize_node_reuses_cached_answer(self, tmp_path, monkeypatch):
+        import src.pipeline as pipeline
+        from src.config import InferenceBackend
+
+        calls = {"n": 0}
+
+        class FakeClient:
+            backend = InferenceBackend.omlx
+            model = "text-model"
+
+            def __init__(self, config):
+                pass
+
+            def chat(self, system, user, **kwargs):
+                calls["n"] += 1
+                return "cached answer"
+
+        monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
+        config = self._config(tmp_path)
+
+        first = pipeline.summarize_node(self._state(config))
+        second = pipeline.summarize_node(self._state(config))
+
+        assert first["summary"] == second["summary"] == "cached answer"
+        assert calls["n"] == 1
+        assert (tmp_path / "summary_cache.json").exists()
+
+    def test_summarize_node_cache_misses_on_a_new_query(self, tmp_path, monkeypatch):
+        import src.pipeline as pipeline
+        from src.config import InferenceBackend
+
+        calls = {"n": 0}
+
+        class FakeClient:
+            backend = InferenceBackend.omlx
+            model = "text-model"
+
+            def __init__(self, config):
+                pass
+
+            def chat(self, system, user, **kwargs):
+                calls["n"] += 1
+                return f"answer {calls['n']}"
+
+        monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
+        config = self._config(tmp_path)
+
+        pipeline.summarize_node(self._state(config, query="first question"))
+        pipeline.summarize_node(self._state(config, query="second question"))
+
+        assert calls["n"] == 2
+
+    def test_summarize_all_node_caches_full_video_summary(self, tmp_path, monkeypatch):
+        import src.pipeline as pipeline
+        from src.config import InferenceBackend
+
+        calls = {"n": 0}
+
+        class FakeClient:
+            backend = InferenceBackend.omlx
+            model = "text-model"
+            base_url = "http://127.0.0.1:8102/v1"
+
+            def __init__(self, config):
+                pass
+
+            def chat(self, system, user, **kwargs):
+                calls["n"] += 1
+                return "whole-video summary"
+
+        monkeypatch.setattr(pipeline, "InferenceClient", FakeClient)
+        config = self._config(tmp_path)
+        config.data_dir = tmp_path
+        state = {
+            "captioned_frames": [
+                {"frame_id": 0, "timestamp_str": "00:00:00.000",
+                 "caption": "Open the app."},
+                {"frame_id": 1, "timestamp_str": "00:00:02.000",
+                 "caption": "Click save."},
+            ],
+            "config": config.model_dump(),
+        }
+
+        first = pipeline.summarize_all_node(state)
+        second = pipeline.summarize_all_node(state)
+
+        assert first["summary"] == second["summary"] == "whole-video summary"
+        assert calls["n"] == 1
+        assert (tmp_path / "summary_cache.json").exists()

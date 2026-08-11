@@ -8,11 +8,11 @@ Backends:
      Works on any platform with Ollama installed.
 """
 import base64
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from tqdm import tqdm
 
@@ -98,13 +98,34 @@ class OpenAICompatibleCaptioner:
         )
         return f"[Error captioning frame: {last_error}]"
 
-    def caption_batch(self, image_paths: list[str]) -> list[str]:
-        """Submit isolated concurrent requests and preserve input order."""
+    def caption_batch(
+        self,
+        image_paths: list[str],
+        on_result: Optional[Callable[[int, str, str], None]] = None,
+    ) -> list[str]:
+        """Submit isolated concurrent requests and preserve input order.
+
+        With ``on_result``, each caption is reported as (index, path, caption)
+        the moment it completes, so callers can persist incrementally instead
+        of waiting for the whole batch.
+        """
         if not image_paths:
             return []
         max_workers = max(1, min(self.config.batch_size, len(image_paths)))
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            return list(pool.map(self._caption_with_retry, image_paths))
+            if on_result is None:
+                return list(pool.map(self._caption_with_retry, image_paths))
+            futures = {
+                pool.submit(self._caption_with_retry, path): i
+                for i, path in enumerate(image_paths)
+            }
+            results: list[str] = [""] * len(image_paths)
+            for future in as_completed(futures):
+                i = futures[future]
+                caption = future.result()
+                results[i] = caption
+                on_result(i, image_paths[i], caption)
+            return results
 
 
 # ── Ollama Backend ──────────────────────────────────────────────────────────
@@ -156,6 +177,24 @@ class OllamaCaptioner:
 
 # ── Factory + Batch Processing ──────────────────────────────────────────────
 
+def _load_cached_caption(output_dir: Optional[str], frame: dict) -> Optional[dict]:
+    """Return a previously saved caption record for ``frame``, if trustworthy.
+
+    The match key is the deterministic frame id plus the stored path basename,
+    so a record only pairs with the frame it was generated from.
+    """
+    caption_file = Path(output_dir) / f"caption_{frame['frame_id']:06d}.json"
+    try:
+        cached = json.loads(caption_file.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not cached.get("caption"):
+        return None
+    if Path(cached.get("path", "")).name != Path(frame["path"]).name:
+        return None
+    return cached
+
+
 def _get_captioner(config: CaptioningConfig):
     """Return the appropriate captioner backend."""
     if config.backend in (CaptionBackend.vllm, CaptionBackend.omlx):
@@ -172,9 +211,10 @@ def caption_frames(
     """
     Generate captions for all extracted frames.
 
-    Drives the captioner via ``caption_batch`` in chunks of ``config.batch_size``.
-    For vLLM/oMLX each chunk becomes concurrent OpenAI-compatible requests.
-    For Ollama it falls back to sequential per-image calls.
+    For vLLM/oMLX all pending frames go through one ``caption_batch`` call,
+    which keeps ``config.batch_size`` requests in flight with no chunk
+    barriers and reports each result as it lands. For Ollama it falls back to
+    sequential per-image calls in chunks.
 
     Adds a 'caption' field to each frame metadata dict.
     Optionally saves per-frame and combined caption JSON files to output_dir.
@@ -195,42 +235,83 @@ def caption_frames(
     batch_size = max(1, int(config.batch_size))
     print(f"Captioning with {backend_name} ({model_name}) — batch_size={batch_size}")
 
-    results: list[dict] = []
-    pbar = tqdm(total=len(frames_meta), desc="Captioning frames")
+    # Resume: a previous run of this folder already captioned some frames. The
+    # per-frame files are keyed by the deterministic frame id, and the stored
+    # path basename must match — anything else is re-captioned. This makes an
+    # interrupted caption pass cheap to continue instead of re-paying every
+    # completed generation.
+    results_by_id: dict[int, dict] = {}
+    pending: list[dict] = []
+    for frame in frames_meta:
+        cached = _load_cached_caption(output_dir, frame) if output_dir else None
+        if cached is not None:
+            results_by_id[frame["frame_id"]] = cached
+        else:
+            pending.append(frame)
+    if results_by_id:
+        print(f"Reusing {len(results_by_id)} cached caption(s); "
+              f"{len(pending)} frame(s) left to caption")
 
-    for chunk_start in range(0, len(frames_meta), batch_size):
-        chunk = frames_meta[chunk_start : chunk_start + batch_size]
-        image_paths = [f["path"] for f in chunk]
+    fresh: dict[int, dict] = {}
+    pbar = tqdm(total=len(pending), desc="Captioning frames")
 
+    def _record(frame: dict, caption: str) -> None:
+        enriched = {**frame, "caption": caption}
+        fresh[frame["frame_id"]] = enriched
+        if output_dir:
+            caption_file = Path(output_dir) / f"caption_{frame['frame_id']:06d}.json"
+            with open(caption_file, "w") as f:
+                json.dump(enriched, f, indent=2)
+        pbar.update(1)
+
+    if isinstance(captioner, OpenAICompatibleCaptioner):
+        # One pool across ALL pending frames. Chunking used to barrier the pool
+        # at every batch_size boundary, so a single slow frame stalled the
+        # entire next chunk; per-frame files still land as each result
+        # arrives, keeping crash-resume granularity.
         try:
-            captions = captioner.caption_batch(image_paths)
+            captioner.caption_batch(
+                [f["path"] for f in pending],
+                on_result=lambda i, _path, caption: _record(pending[i], caption),
+            )
         except Exception as e:
-            logger.error(
-                f"Batch caption failed (frames "
-                f"{chunk[0]['frame_id']}–{chunk[-1]['frame_id']}): {e}"
-            )
-            captions = [f"[Error captioning frame: {e}]"] * len(chunk)
+            logger.error(f"Batch caption failed: {e}")
+            for frame in pending:
+                if frame["frame_id"] not in fresh:
+                    _record(frame, f"[Error captioning frame: {e}]")
+    else:
+        # Ollama and stub captioners: caption_batch is sequential, so the
+        # chunk loop costs nothing and keeps per-chunk persistence.
+        for chunk_start in range(0, len(pending), batch_size):
+            chunk = pending[chunk_start : chunk_start + batch_size]
+            image_paths = [f["path"] for f in chunk]
 
-        # Defensive: pad/truncate if the backend returned the wrong count
-        if len(captions) != len(chunk):
-            logger.warning(
-                f"caption_batch returned {len(captions)} results for {len(chunk)} frames; "
-                f"padding with error markers"
-            )
-            captions = (captions + ["[Error: missing caption]"] * len(chunk))[: len(chunk)]
+            try:
+                captions = captioner.caption_batch(image_paths)
+            except Exception as e:
+                logger.error(
+                    f"Batch caption failed (frames "
+                    f"{chunk[0]['frame_id']}–{chunk[-1]['frame_id']}): {e}"
+                )
+                captions = [f"[Error captioning frame: {e}]"] * len(chunk)
 
-        for frame, caption in zip(chunk, captions):
-            enriched = {**frame, "caption": caption}
-            results.append(enriched)
+            # Defensive: pad/truncate if the backend returned the wrong count
+            if len(captions) != len(chunk):
+                logger.warning(
+                    f"caption_batch returned {len(captions)} results for {len(chunk)} frames; "
+                    f"padding with error markers"
+                )
+                captions = (captions + ["[Error: missing caption]"] * len(chunk))[: len(chunk)]
 
-            if output_dir:
-                caption_file = Path(output_dir) / f"caption_{frame['frame_id']:06d}.json"
-                with open(caption_file, "w") as f:
-                    json.dump(enriched, f, indent=2)
-
-        pbar.update(len(chunk))
+            for frame, caption in zip(chunk, captions):
+                _record(frame, caption)
 
     pbar.close()
+
+    results = [
+        (results_by_id.get(frame["frame_id"]) or fresh[frame["frame_id"]])
+        for frame in frames_meta
+    ]
 
     # Save combined captions
     if output_dir:

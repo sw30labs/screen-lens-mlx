@@ -90,12 +90,12 @@ if [[ ! -f .env && -f .env.example ]]; then
     log "Created .env from .env.example; review its Apple Silicon/oMLX settings."
 fi
 
-log "Installing ScreenLens and TUI support in editable mode"
+log "Installing ScreenLens in editable mode"
 "$CONDA_BIN" run --no-capture-output --name "$ENV_NAME" \
-    python -m pip install --editable "${REPO_ROOT}[all]"
+    python -m pip install --editable "${REPO_ROOT}"
 
 if [[ $# -eq 0 ]]; then
-    set -- tui
+    set -- serve
 fi
 
 log "Launching ScreenLens"

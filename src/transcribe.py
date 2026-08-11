@@ -26,6 +26,7 @@ from .omlx_client import (
     InferenceClient,
     degenerate_repetition,
     resolve_llm_model,
+    resolve_ocr_model,
     resolve_role_api_key,
     resolve_role_backend,
     resolve_role_base_url,
@@ -137,6 +138,44 @@ def _cleanup_transcript(text: str, cfg) -> str:
     return "\n\n".join(out).strip() + "\n"
 
 
+def _video_size(video_path: str) -> int | None:
+    """Byte size of the video, None when it cannot be stat'ed (tests, removed files)."""
+    try:
+        return Path(video_path).stat().st_size
+    except OSError:
+        return None
+
+
+def _load_cached_ocr(ocr_dir: Path) -> dict[str, str]:
+    """Map frame filename → OCR text from the run folder's saved records.
+
+    Prefers the combined ``all_ocr.json``; falls back to the per-frame files
+    a run interrupted mid-OCR would have left behind.
+    """
+    records: list[dict] = []
+    combined = ocr_dir / "all_ocr.json"
+    try:
+        if combined.exists():
+            data = json.loads(combined.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                records = data
+    except Exception:
+        records = []
+    if not records:
+        for path in sorted(ocr_dir.glob("ocr_*.json")):
+            try:
+                records.append(json.loads(path.read_text(encoding="utf-8")))
+            except Exception:
+                continue
+    cached: dict[str, str] = {}
+    for rec in records:
+        name = Path(str(rec.get("path", ""))).name
+        text = rec.get("ocr")
+        if name and isinstance(text, str):
+            cached[name] = text
+    return cached
+
+
 def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) -> dict:
     """Run the full verbatim pipeline for one video. Returns a result dict."""
     t0 = time.time()
@@ -154,9 +193,32 @@ def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) 
     logger.info("Selected %d frames", len(frames))
 
     # 2. Verbatim OCR (vision model) ─────────────────────────────────────────
-    ocr = VerbatimOCR(config.ocr)
-    paths = [f["path"] for f in frames]
-    texts = ocr.ocr_frames(paths)  # raises loudly if the model is blind
+    # Resume from any OCR this run folder already holds: records pair with
+    # frames by deterministic filename, so a re-run of the same video only
+    # sends the frames the model has not read yet.
+    cached = _load_cached_ocr(ocr_dir)
+    texts_by_name: dict[str, str] = {}
+    missing: list[dict] = []
+    for f in frames:
+        hit = cached.get(Path(f["path"]).name)
+        if hit is None:
+            missing.append(f)
+        else:
+            texts_by_name[Path(f["path"]).name] = hit
+
+    ocr_model = resolve_ocr_model(config.ocr)
+    if missing:
+        ocr = VerbatimOCR(config.ocr)
+        ocr_model = ocr.model
+        new_texts = ocr.ocr_frames([f["path"] for f in missing])  # raises loudly if the model is blind
+        for f, txt in zip(missing, new_texts):
+            texts_by_name[Path(f["path"]).name] = txt
+    texts = [texts_by_name[Path(f["path"]).name] for f in frames]
+    if cached:
+        logger.info(
+            "Reused %d cached OCR result(s); %d frame(s) sent to the model",
+            len(frames) - len(missing), len(missing),
+        )
 
     ocr_records = []
     for f, txt in zip(frames, texts):
@@ -172,20 +234,18 @@ def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) 
     # The raw transcript stays byte-faithful to what the model read, so a frame
     # where the model got stuck is reported rather than edited — trimming it
     # here could just as easily delete a screen that genuinely repeats.
-    degenerate_frames = [
-        f["frame_id"]
-        for f, txt in zip(frames, texts)
-        if degenerate_repetition(txt) is not None
-    ]
-    for frame_id, txt in ((f["frame_id"], t) for f, t in zip(frames, texts)):
+    degenerate_frames = []
+    for f, txt in zip(frames, texts):
         unit = degenerate_repetition(txt)
-        if unit is not None:
-            logger.warning(
-                "frame %d OCR ends in a repetition loop (%r repeated); the "
-                "transcript keeps it verbatim, but treat that frame as suspect.",
-                frame_id,
-                unit,
-            )
+        if unit is None:
+            continue
+        degenerate_frames.append(f["frame_id"])
+        logger.warning(
+            "frame %d OCR ends in a repetition loop (%r repeated); the "
+            "transcript keeps it verbatim, but treat that frame as suspect.",
+            f["frame_id"],
+            unit,
+        )
 
     # 3. Stitch (text-space dedup) ───────────────────────────────────────────
     frames_lines = [t.splitlines() for t in texts]
@@ -212,10 +272,11 @@ def transcribe_video(video_path: str, config: ScreenLensConfig, data_dir: Path) 
 
     meta = {
         "video": str(Path(video_path).resolve()),
+        "video_size": _video_size(video_path),
         "frames_selected": len(frames),
         "frames_with_text": non_empty,
         "degenerate_frames": degenerate_frames,
-        "ocr_model": ocr.model,
+        "ocr_model": ocr_model,
         "llm_model": resolve_llm_model(config.reconstruction) if config.reconstruction.enabled else None,
         "transcript_path": str(clean_path),
         "raw_transcript_path": str(raw_path),

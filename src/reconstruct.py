@@ -15,6 +15,7 @@ Architecture:
 Uses LangGraph's Send API for conditional parallel dispatch and
 Annotated reducers for collecting sub-agent outputs.
 """
+import hashlib
 import json
 import logging
 import operator
@@ -214,6 +215,8 @@ class ReconstructState(TypedDict, total=False):
     folder_path: str
     folder_name: str
     captions: list[dict]
+    # sha1 of the captions file — ties persisted Pass-1 notes to their source.
+    captions_sha1: str
     config: dict
 
     # Classification
@@ -225,6 +228,10 @@ class ReconstructState(TypedDict, total=False):
     system_prompt: str
     reconstruction_tasks: list[dict]
     parallel_safe: bool
+    # Cached python_code plan (files + parallel_safe). The plan generation
+    # input does not depend on QA feedback, so QA retries reuse it instead of
+    # re-running the expensive full-context file identification.
+    reconstruction_plan: dict
 
     # Hierarchical Pass-1 cache. Populated once per recording on the first
     # reconstruction iteration; reused unchanged across QA retries because the
@@ -416,6 +423,48 @@ def _synthesis_output_reserve(output_ceiling: int, model_context: int) -> int:
     return max(
         MIN_RECONSTRUCTION_OUTPUT_TOKENS,
         min(output_ceiling, max(MIN_RECONSTRUCTION_OUTPUT_TOKENS, context_reserve)),
+    )
+
+
+# ── Segment Notes Persistence ────────────────────────────────────────────────
+
+def _captions_sha1(captions_file: Path) -> str:
+    """Return the sha1 hex digest of the captions file bytes."""
+    return hashlib.sha1(captions_file.read_bytes()).hexdigest()
+
+
+def _segment_notes_path(folder: Path) -> Path:
+    """Return the on-disk location of the persisted Pass-1 segment notes."""
+    return folder / "output" / "segment_notes.json"
+
+
+def _load_persisted_segment_notes(folder: Path, sha1: str) -> list[str]:
+    """Load persisted Pass-1 segment notes if they match the captions sha1.
+
+    Returns [] when the file is missing, unreadable, not valid JSON, or was
+    produced from a different captions file — never raises, since a corrupt
+    cache simply means re-running Pass 1.
+    """
+    path = _segment_notes_path(folder)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict) or data.get("captions_sha1") != sha1:
+        return []
+    notes = data.get("notes")
+    if not isinstance(notes, list):
+        return []
+    return notes
+
+
+def _persist_segment_notes(folder: Path, sha1: str, notes: list[str]) -> None:
+    """Persist Pass-1 segment notes so an interrupted run can skip re-extraction."""
+    path = _segment_notes_path(folder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"captions_sha1": sha1, "notes": notes}),
+        encoding="utf-8",
     )
 
 
@@ -735,24 +784,38 @@ def plan_node(state: ReconstructState) -> dict:
     if content_type == "python_code":
         system_prompt = RECONSTRUCT_PYTHON_SYSTEM
 
-        # File identification needs visibility into the whole recording, so
-        # use a stratified sample rather than the linear opening slice.
-        sampled = _stratified_sample(captions, 60)
-        sample_block = _build_caption_block(sampled, max_chars=80000)
-        file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
-        # The file list is unbounded — one entry per Python file visible, each
-        # with a description and key_content — so it cannot share the classifier's
-        # small fixed cap. Let the model run to its natural stop.
-        plan_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
-        response = generate_text(client, PLAN_PYTHON_SYSTEM,
-                                  file_id_prompt, max_tokens=plan_ceiling,
-                                  temperature=0.1)
-        plan = parse_json_response(response)
+        cached_plan = state.get("reconstruction_plan") or {}
+        if cached_plan.get("files"):
+            # QA retry: the plan generation input does not depend on QA
+            # feedback, so reuse the cached plan instead of re-running the
+            # expensive full-context file identification.
+            files = cached_plan["files"]
+            parallel_safe = cached_plan.get("parallel_safe", False)
+            print(f"  Identified {len(files)} Python file(s) (cached plan):")
+        else:
+            # File identification needs visibility into the whole recording, so
+            # use a stratified sample rather than the linear opening slice.
+            sampled = _stratified_sample(captions, 60)
+            sample_block = _build_caption_block(sampled, max_chars=80000)
+            file_id_prompt = f"Frame captions from a Python coding session:\n\n{sample_block}"
+            # The file list is unbounded — one entry per Python file visible, each
+            # with a description and key_content — so it cannot share the classifier's
+            # small fixed cap. Let the model run to its natural stop.
+            plan_ceiling = _long_form_output_ceiling(client, _get_model_context_size(client))
+            response = generate_text(client, PLAN_PYTHON_SYSTEM,
+                                      file_id_prompt, max_tokens=plan_ceiling,
+                                      temperature=0.1)
+            plan = parse_json_response(response)
 
-        files = plan.get("files", [{"filename": "reconstructed.py",
-                                     "description": "Main script"}])
-        parallel_safe = plan.get("parallel_safe", False) and len(files) > 1
+            files = plan.get("files", [{"filename": "reconstructed.py",
+                                         "description": "Main script"}])
+            parallel_safe = plan.get("parallel_safe", False) and len(files) > 1
+            print(f"  Identified {len(files)} Python file(s):")
 
+        for f in files:
+            print(f"    - {f['filename']}: {f.get('description', '')}")
+
+        # Tasks are rebuilt every iteration — they embed the QA feedback.
         for f in files:
             task_prompt = (
                 f"Reconstruct the file '{f['filename']}' ({f.get('description', '')}).\n\n"
@@ -768,10 +831,6 @@ def plan_node(state: ReconstructState) -> dict:
                 "prompt": task_prompt,
                 "output_type": "python",
             })
-
-        print(f"  Identified {len(files)} Python file(s):")
-        for f in files:
-            print(f"    - {f['filename']}: {f.get('description', '')}")
 
     elif content_type == "markdown_document":
         system_prompt = RECONSTRUCT_MARKDOWN_SYSTEM
@@ -830,13 +889,20 @@ def plan_node(state: ReconstructState) -> dict:
     elapsed = time.time() - t0
     print(f"  Planned in {elapsed:.1f}s")
 
-    return {
+    result = {
         "system_prompt": system_prompt,
         "reconstruction_tasks": tasks,
         "parallel_safe": parallel_safe,
         "stage": "planned",
         "elapsed_seconds": {**state.get("elapsed_seconds", {}), "plan": round(elapsed, 2)},
     }
+    if content_type == "python_code":
+        # Cache the plan in state so QA retries skip the regeneration above.
+        result["reconstruction_plan"] = {
+            "files": files,
+            "parallel_safe": parallel_safe,
+        }
+    return result
 
 
 def reconstruct_worker(state: dict) -> dict:
@@ -855,6 +921,12 @@ def reconstruct_worker(state: dict) -> dict:
 
     if not segment_notes and captions:
         segment_notes = _extract_segment_notes(captions, client, model_context)
+        # Persist Pass 1 so an interrupted run can skip the re-extraction.
+        captions_sha1 = state.get("captions_sha1", "")
+        if captions_sha1:
+            _persist_segment_notes(
+                Path(state["folder_path"]), captions_sha1, segment_notes,
+            )
 
     task_system = task.get("system_override", state.get("system_prompt", ""))
     task_user_prefix = task["prompt"]
@@ -918,6 +990,12 @@ def reconstruct_sequential(state: ReconstructState) -> dict:
         )
         print(f"  [Pass 1] Produced {len(segment_notes)} segment notes "
               f"in {time.time() - t1:.1f}s")
+        # Persist Pass 1 so an interrupted/re-run invocation skips re-extraction.
+        captions_sha1 = state.get("captions_sha1", "")
+        if captions_sha1:
+            _persist_segment_notes(
+                Path(state["folder_path"]), captions_sha1, segment_notes,
+            )
     else:
         print(f"  [Pass 1] Reusing {len(segment_notes)} cached segment notes "
               f"(QA iteration {qa_iteration})")
@@ -1193,14 +1271,25 @@ def reconstruct_folder(folder_path: str, config: ScreenLensConfig) -> dict:
     if not captions:
         return {"error": "Captions file is empty", "stage": "error"}
 
+    captions_sha1 = _captions_sha1(captions_file)
+
     pipeline = build_reconstruct_graph()
     initial_state = {
         "folder_path": str(folder),
         "folder_name": folder.name,
         "captions": captions,
+        "captions_sha1": captions_sha1,
         "config": config.model_dump(),
         "artifacts": [],
         "qa_iteration": 0,
     }
+
+    # Reuse Pass-1 notes persisted by an earlier interrupted/failed run — the
+    # CLI only reaches here when output/reconstruction_meta.json is missing.
+    persisted_notes = _load_persisted_segment_notes(folder, captions_sha1)
+    if persisted_notes:
+        print(f"  Reusing {len(persisted_notes)} persisted segment notes "
+              f"from {_segment_notes_path(folder)}")
+        initial_state["segment_notes"] = persisted_notes
 
     return pipeline.invoke(initial_state)

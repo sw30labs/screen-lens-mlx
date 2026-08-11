@@ -45,7 +45,7 @@ The vLLM and oMLX paths share the same small OpenAI-compatible client, including
 | Visual embeddings | OpenCLIP ViT-B-32 | Semantic image/text vectors on CUDA, MPS, or CPU |
 | Vector storage | ChromaDB | Persistent per-video semantic search |
 | Reconstruction | LangGraph | Classify recordings and rebuild code/docs/demo artifacts with QA retries |
-| Interfaces | Typer + Rich, optional Textual | CLI and terminal GUI |
+| Interfaces | Typer + Rich, web command deck | CLI and browser GUI |
 
 ## Platform Defaults
 
@@ -76,7 +76,7 @@ ${EDITOR:-nano} .env  # add HF_TOKEN=hf_... if ScreenLens must start vLLM
 ./setup_and_run_dgx.sh run
 ```
 
-`run` launches the TUI with no arguments or passes a CLI command through:
+`run` launches the web command deck (`serve --no-browser`) with no arguments or passes a CLI command through:
 
 ```bash
 ./setup_and_run_dgx.sh run ingest input-videos/demo.mov
@@ -94,12 +94,12 @@ Start oMLX on `http://127.0.0.1:8000/v1`, configure `MLX_*` or `OMLX_*` values i
 ./setup_and_run_macos.sh ingest "video.mov"
 ```
 
-The script creates a `screenlens` Conda environment with Python 3.11 and ffmpeg, installs the TUI extra, preserves an existing `.env`, and defaults to the TUI. Set `SCREENLENS_CONDA_ENV` to choose another environment name. On Linux/ARM64 it exits with directions to the checked Spark helper so a generic pip install cannot replace CUDA 13 wheels with CPU wheels.
+The script creates a `screenlens` Conda environment with Python 3.11 and ffmpeg, installs the package in editable mode, preserves an existing `.env`, and defaults to the web command deck (`serve`). Set `SCREENLENS_CONDA_ENV` to choose another environment name. On Linux/ARM64 it exits with directions to the checked Spark helper so a generic pip install cannot replace CUDA 13 wheels with CPU wheels.
 
 ### Manual development install
 
 ```bash
-pip install -e ".[dev,tui]"
+pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
@@ -130,19 +130,22 @@ ScreenLens drives two roles against one OpenAI-compatible endpoint:
 | Role | Used by | Requirement | oMLX default |
 |---|---|---|---|
 | **vision** | captioning, verbatim OCR | must be vision-capable — a text-only model answers "no image provided" for every frame | `Qwen3.6-27B-bf16` (`OCR_MODEL` / `MLX_MODEL`) |
-| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; must stay coherent on markdown with indented lists, which is what captions are | `Qwen3.6-27B-bf16` (`LLM_MODEL`) |
+| **text** | summaries, reconstruction plan/QA, transcript cleanup | never sees an image; must stay coherent on markdown with indented lists, which is what captions are | `DeepSeek-V4-Flash-0731-MXFP4-MLX` (`LLM_MODEL`) |
 
-On DGX Spark both resolve to the single served vLLM checkpoint. The defaults do
-the same on Apple Silicon — one resident checkpoint serving both roles — but the
-roles resolve independently, so pointing `LLM_MODEL` at a dedicated text model
-is fully supported.
+On DGX Spark both resolve to the single served vLLM checkpoint. On Apple
+Silicon the defaults split the roles — Qwen3.6 sees, DeepSeek-V4-Flash reasons
+— and they resolve independently, so pointing `LLM_MODEL` at
+`Qwen3.6-27B-bf16` to keep one resident checkpoint is fully supported.
 
-Test any such model against a real caption first. `DeepSeek-V4-Flash-0731-MLX`
-under oMLX emits its BOS token until the token budget runs out when the prompt
-contains a markdown list item with a leading indent (`\n   - `), which every
-caption has. ScreenLens detects that shape and raises `InferenceDegenerateError`
-rather than saving the output as a summary, so the failure is loud rather than
-silent — but the model still cannot do the work.
+The DeepSeek text default is guarded against the family's known failure mode
+on ScreenLens inputs. `DeepSeek-V4-Flash-0731-MLX` (the older 8-bit build)
+under oMLX emits its BOS token until the token budget runs out when a
+multi-sentence system prompt accompanies a markdown list item with a leading
+indent (`\n   - `), which every caption has. ScreenLens folds the system
+prompt into the user turn for `deepseek-v4` ids — the verified fix — and
+detects any output that still degenerates, raising `InferenceDegenerateError`
+rather than saving it as a summary, so a failure is loud rather than silent.
+If you see that error, fall back to `Qwen3.6-27B-bf16` for the text role.
 
 Check what your endpoint serves and which side of the vision line each model
 falls on:
@@ -172,6 +175,10 @@ python -m src.cli run "video.mov" "Summarize the workflow"
 
 Search summarization follows the configured platform backend; it does not require Ollama unless Ollama was explicitly selected. Each ingestion creates `data/<stem>_<YYYYMMDD_HHMMSS>/` with independent frames, captions, and ChromaDB data.
 
+Re-running a pipeline on the same video resumes the newest prior run instead of paying for the same work twice: ingestion reuses the extracted frames, any per-frame captions already written, and a populated vector store; transcription reuses cached OCR. Resume only engages when the run's stored video path/size and extraction config still match — pass `--fresh` to force a new run folder (supported by `ingest`, `run`, `batch`, and `transcribe`; the web deck resumes automatically).
+
+Repeated work is avoided at other layers too: the CLIP embedder is a process-wide shared instance, so the web deck and multi-collection searches load OpenCLIP once instead of per query; search and full-video summaries are cached per run folder in `summary_cache.json` (keyed by model + prompt content); captioning keeps all pending frames in flight in a single pool with `batch_size` workers rather than stalling at each chunk boundary; and verbatim OCR sends frames to the server as in-memory JPEG q92 re-encodes — on-disk frames stay lossless PNG — shrinking multi-MB payloads roughly 5–10×.
+
 ### Batch Ingestion and Full-Video Summary
 
 ```bash
@@ -188,7 +195,7 @@ python -m src.cli reconstruct
 python -m src.cli assemble
 ```
 
-Reconstruction classifies each recording, plans the artifact work, processes it deterministically, and runs up to three QA iterations before saving under `data/<slug>/output/`. Assembly can combine per-recording outputs into one project tree under `OUTPUT/`.
+Reconstruction classifies each recording, plans the artifact work, processes it deterministically, and runs up to three QA iterations before saving under `data/<slug>/output/`. Completed folders are skipped, Pass-1 segment notes are persisted to `output/segment_notes.json` so an interrupted run resumes cheaply, and the planning generation is cached across QA retries. Assembly can combine per-recording outputs into one project tree under `OUTPUT/`.
 
 ### Verbatim Transcription
 
@@ -237,14 +244,13 @@ The header shows both model roles at once. If the configured vision model is
 not vision-capable the badge turns red before you waste a run on it, and the
 vision selector only offers models that can actually see.
 
-### Status and TUI
+### Status
 
 ```bash
 python -m src.cli info
-python -m src.cli tui
 ```
 
-The TUI detects the native platform default, lists models from the selected OpenAI-compatible endpoint, and supports ingest, reconstruct, and combined workflows.
+Prints vector-store stats for the collections under `./data/`. For anything interactive — picking models, starting pipelines, browsing frames and artifacts — use the web command deck above; it is the primary GUI.
 
 ## Keyframe Detection
 
@@ -329,9 +335,8 @@ src/
   stitch.py            # Text-space scroll-overlap stitching
   transcribe.py        # Verbatim pipeline and guarded cleanup
   omlx_client.py       # Shared inference client; legacy module name retained
-  session.py           # Shared config/slug/run-discovery layer for all front ends
+  session.py           # Shared config/slug/run-discovery layer for both front ends
   cli.py               # Typer CLI
-  tui.py               # Optional Textual terminal GUI
   web/                 # Web command deck (stdlib HTTP, no build step)
     server.py          # Loopback-only JSON API + static page
     runner.py          # One-job-at-a-time background runner

@@ -1,10 +1,10 @@
-"""Shared run/session helpers for the CLI, TUI, and web command deck.
+"""Shared run/session helpers for the CLI and the web command deck.
 
 Everything here is UI-agnostic: config loading, per-video slug allocation,
 role-aware inference wiring, and read-only discovery of what already lives
-under ``./data/``. The three front ends (``cli.py``, ``tui.py``,
-``web/runner.py``) all build on these so a run started from the browser lands
-in exactly the same layout as one started from the terminal.
+under ``./data/``. Both front ends (``cli.py``, ``web/runner.py``) build on
+these so a run started from the browser lands in exactly the same layout as
+one started from the terminal.
 
 Model roles
 -----------
@@ -51,6 +51,11 @@ __all__ = [
     "load_config",
     "apply_video_slug",
     "point_config_at_data_dir",
+    "find_reusable_run",
+    "reuse_video_run",
+    "extraction_meta_matches",
+    "load_cached_frames",
+    "transcribe_run_matches",
     "apply_direct_inference",
     "text_role_captioning_config",
     "model_roles",
@@ -106,6 +111,117 @@ def point_config_at_data_dir(config: ScreenLensConfig, data_dir: Path | str) -> 
     path = Path(data_dir)
     config.data_dir = path
     config.vector_db.persist_directory = str(path / "chromadb")
+
+
+# ── run reuse (write-side) ────────────────────────────────────────────────────
+# Re-running a pipeline on the same video used to mint a fresh timestamped
+# folder and re-pay the entire model cost. These helpers let the CLI and the
+# web runner pick the newest prior run of the SAME video instead, so each
+# stage can skip work its artifacts already cover. `--fresh` opts out.
+
+
+def find_reusable_run(
+    config: ScreenLensConfig, video: Path, required: str
+) -> Optional[Path]:
+    """Newest ``<stem>_<ts>`` run folder under ``config.data_dir`` with ``required``.
+
+    ``required`` is a path relative to the run folder (e.g. ``"ocr"`` or
+    ``"frames/frames_meta.json"``). The timestamp suffix sorts
+    chronologically, so name order is newest-first.
+    """
+    stem = video.stem.replace(" ", "_")
+    base = Path(config.data_dir)
+    if not base.is_dir():
+        return None
+    candidates = sorted(
+        (d for d in base.glob(f"{stem}_*") if d.is_dir() and (d / required).exists()),
+        key=lambda d: d.name,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def reuse_video_run(config: ScreenLensConfig, video: Path, run_dir: Path) -> str:
+    """Point ``config`` at an existing run folder and return its slug.
+
+    Keeps the per-stem collection naming, so search targets the same
+    collection a fresh run of this video would have used.
+    """
+    stem = video.stem.replace(" ", "_")
+    run_dir = Path(run_dir)
+    config.data_dir = run_dir
+    config.vector_db.persist_directory = str(run_dir / "chromadb")
+    config.vector_db.collection_name = f"screenlens_{stem}"
+    return run_dir.name
+
+
+def extraction_meta_matches(
+    run_dir: Path, video: Path, config: ScreenLensConfig
+) -> bool:
+    """True when the run's stored extraction metadata matches this video+config.
+
+    Without this guard a change of strategy/fps — or a replaced video file —
+    would silently pair new frames with stale captions.
+    """
+    try:
+        meta = json.loads(
+            (Path(run_dir) / "frames" / "frames_meta.json").read_text(encoding="utf-8")
+        )
+    except Exception:
+        return False
+    if meta.get("video") != str(video.resolve()):
+        return False
+    try:
+        size = meta.get("video_size")
+        if size is not None and int(size) != video.stat().st_size:
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return meta.get("extraction") == config.frame_extraction.model_dump(mode="json")
+
+
+def load_cached_frames(
+    run_dir: Path, video: Path, config: ScreenLensConfig
+) -> Optional[list[dict]]:
+    """Return a prior run's extracted-frame metadata when it is safe to reuse."""
+    if not extraction_meta_matches(run_dir, video, config):
+        return None
+    try:
+        meta = json.loads(
+            (Path(run_dir) / "frames" / "frames_meta.json").read_text(encoding="utf-8")
+        )
+        frames = meta["frames"]
+        assert isinstance(frames, list)
+    except Exception:
+        return None
+    if not frames or not all(Path(f.get("path", "")).is_file() for f in frames):
+        return None
+    return frames
+
+
+def transcribe_run_matches(run_dir: Path, video: Path) -> bool:
+    """True when a transcribe run folder belongs to this video.
+
+    The meta file only exists after a fully successful run, so an OCR cache
+    without it is still accepted — the stem match plus deterministic frame
+    names keep the pairing safe; pass ``--fresh`` after replacing a video.
+    """
+    meta_path = Path(run_dir) / "output" / "transcribe_meta.json"
+    if not meta_path.exists():
+        return True
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if meta.get("video") != str(video.resolve()):
+        return False
+    try:
+        size = meta.get("video_size")
+        if size is not None and int(size) != video.stat().st_size:
+            return False
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
 
 
 def apply_direct_inference(

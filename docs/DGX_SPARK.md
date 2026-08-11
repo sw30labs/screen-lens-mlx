@@ -169,7 +169,9 @@ but not actually processing vision content.
 
 ## Running ScreenLens
 
-With no additional arguments, `run` launches the TUI:
+With no additional arguments, `run` launches the web command deck
+(`serve --no-browser`, loopback-only on port 8760 — reach it from your
+workstation with an SSH port forward):
 
 ```bash
 ./setup_and_run_dgx.sh run

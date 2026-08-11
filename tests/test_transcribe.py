@@ -278,3 +278,207 @@ def test_transcribe_reports_degenerate_frames_without_editing_them():
     # A screen that genuinely repeats whole statements is not "stuck".
     faithful = "INSERT INTO t VALUES (1, 'abc', 'def');\n" * 20
     assert degenerate_repetition(faithful) is None
+
+
+# ── Stitch canonicalization fast path ────────────────────────────────────────
+#
+# _canon_ids gained an exact-match dict + length gate; these tests pin parity
+# with the original all-pairs scan it replaced.
+
+def _naive_canon_ids(norm_a, norm_b, fuzzy):
+    """Reference: the original all-pairs fuzzy scan, kept to prove parity."""
+    from difflib import SequenceMatcher
+    canons = []
+
+    def get_id(s):
+        if not s:
+            return -1
+        for idx, c in enumerate(canons):
+            if SequenceMatcher(None, s, c).ratio() >= fuzzy:
+                return idx
+        canons.append(s)
+        return len(canons) - 1
+
+    return [get_id(s) for s in norm_a], [get_id(s) for s in norm_b]
+
+
+def test_canon_ids_matches_naive_scan():
+    from src.stitch import _canon_ids
+
+    fixtures = [
+        (["alpha", "beta", "alpha"], ["beta", "gamma"]),          # exact repeats
+        (["def main():", "    return 0"], ["def  main():", "    return 1"]),  # flicker
+        (["", "x", ""], ["", "x"]),                               # blanks
+        (["ab", "abcdefgh", "ab"], ["abcdefgh", "ab"]),           # length extremes
+        (["page 3 of 16", "page 4 of 16"], ["page 4 of 16", "page 5 of 16"]),
+        (["abcde", "abcdf"], ["abcde"]),                          # first-match-wins
+        ([], ["only-b"]),                                         # empty tail
+        ([f"line {i}" for i in range(50)],
+         [f"line {i}" for i in range(40, 70)]),                   # scroll overlap
+    ]
+    for a, b in fixtures:
+        for fuzzy in (0.85, 0.7, 0.95):
+            assert _canon_ids(a, b, fuzzy) == _naive_canon_ids(a, b, fuzzy)
+
+
+def _counting_sequence_matcher(monkeypatch):
+    import src.stitch as stitch
+    from difflib import SequenceMatcher as RealSM
+
+    calls = []
+
+    class CountingSM(RealSM):
+        def ratio(self):
+            calls.append(1)
+            return super().ratio()
+
+    monkeypatch.setattr(stitch, "SequenceMatcher", CountingSM)
+    return calls
+
+
+def test_canon_ids_exact_hits_skip_fuzzy_scan(monkeypatch):
+    import src.stitch as stitch
+
+    calls = _counting_sequence_matcher(monkeypatch)
+    a = ["alpha", "beta"]
+    ids = stitch._canon_ids(a, list(a), 0.85)
+    # "beta" vs "alpha" is the only pair that reaches the ratio call; the
+    # second frame's lines are exact repeats and never touch SequenceMatcher.
+    assert len(calls) == 1
+    assert ids == ([0, 1], [0, 1])
+
+
+def test_canon_ids_length_gate_skips_fuzzy_scan(monkeypatch):
+    import src.stitch as stitch
+
+    calls = _counting_sequence_matcher(monkeypatch)
+    ids = stitch._canon_ids(["ab", "abcdefgh"], [], 0.85)
+    # A 6-char difference cannot reach a 0.85 ratio, so no scan call at all.
+    assert calls == []
+    assert ids == ([0, 1], [])
+
+
+# ── OCR resume ───────────────────────────────────────────────────────────────
+
+_RESUME_META = [
+    {"frame_id": 0, "frame_index": 0, "timestamp": 0.0,
+     "timestamp_str": "00:00:00.000", "path": "/tmp/f0.png", "width": 100, "height": 100},
+    {"frame_id": 1, "frame_index": 1, "timestamp": 1.0,
+     "timestamp_str": "00:00:01.000", "path": "/tmp/f1.png", "width": 100, "height": 100},
+]
+_RESUME_TEXTS = {
+    "f0.png": "first frame line one\nfirst frame line two",
+    "f1.png": "ZZZ different\nQQQ unrelated",
+}
+
+
+def _resume_mocks(monkeypatch, calls):
+    import src.transcribe as T
+
+    monkeypatch.setattr(T, "select_frames", lambda *a, **k: list(_RESUME_META))
+
+    class _MockOCR:
+        model = "mock-vision"
+
+        def __init__(self, cfg):
+            pass
+
+        def ocr_frames(self, paths):
+            batch = [p for p in paths]
+            calls.append(batch)
+            from pathlib import Path as _P
+            return [_RESUME_TEXTS[_P(p).name] for p in batch]
+
+    monkeypatch.setattr(T, "VerbatimOCR", _MockOCR)
+
+
+def test_transcribe_resume_reuses_cached_ocr(tmp_path, monkeypatch):
+    """A re-run over a populated ocr/ dir never constructs the OCR client."""
+    import src.transcribe as T
+    from src.config import ScreenLensConfig
+
+    calls = []
+    _resume_mocks(monkeypatch, calls)
+    cfg = ScreenLensConfig()
+    cfg.reconstruction.enabled = False
+
+    first = T.transcribe_video("/fake/video.mov", cfg, tmp_path)
+    assert first["stage"] == "done"
+    assert calls == [["/tmp/f0.png", "/tmp/f1.png"]]
+
+    class _BombOCR:
+        def __init__(self, cfg):
+            raise AssertionError("OCR client must not be constructed on a full cache hit")
+
+    monkeypatch.setattr(T, "VerbatimOCR", _BombOCR)
+    second = T.transcribe_video("/fake/video.mov", cfg, tmp_path)
+    assert second["stage"] == "done"
+    transcript = (tmp_path / "output" / "transcript.md").read_text()
+    for line in ("first frame line one", "first frame line two", "ZZZ different", "QQQ unrelated"):
+        assert line in transcript
+
+
+def test_transcribe_resume_ocrs_only_missing_frames(tmp_path, monkeypatch):
+    """A partial OCR cache sends only the uncovered frames to the model."""
+    import json
+    import src.transcribe as T
+    from src.config import ScreenLensConfig
+
+    ocr_dir = tmp_path / "ocr"
+    ocr_dir.mkdir(parents=True)
+    (ocr_dir / "all_ocr.json").write_text(json.dumps(
+        [{**_RESUME_META[0], "ocr": _RESUME_TEXTS["f0.png"]}]))
+
+    calls = []
+    _resume_mocks(monkeypatch, calls)
+    cfg = ScreenLensConfig()
+    cfg.reconstruction.enabled = False
+
+    result = T.transcribe_video("/fake/video.mov", cfg, tmp_path)
+    assert result["stage"] == "done"
+    assert calls == [["/tmp/f1.png"]]
+    combined = json.loads((tmp_path / "ocr" / "all_ocr.json").read_text())
+    assert [r["ocr"] for r in combined] == [_RESUME_TEXTS["f0.png"], _RESUME_TEXTS["f1.png"]]
+
+
+def test_image_data_url_reencodes_png_to_jpeg_on_the_wire(tmp_path):
+    """OCR payloads ship as JPEG while the stored frame stays lossless PNG."""
+    import base64 as b64
+    import io
+    from PIL import Image
+    from src.omlx_client import _image_data_url
+
+    # Noise compresses poorly as PNG, so the wire saving shows up even tiny.
+    png = tmp_path / "frame.png"
+    Image.effect_noise((640, 400), 64).convert("RGB").save(png)
+
+    plain = _image_data_url(str(png))
+    assert plain.startswith("data:image/png;base64,")
+
+    wired = _image_data_url(str(png), force_jpeg=True)
+    assert wired.startswith("data:image/jpeg;base64,")
+    decoded = Image.open(io.BytesIO(b64.b64decode(wired.split(",", 1)[1])))
+    assert decoded.format == "JPEG"
+    assert decoded.size == (640, 400)
+    assert len(wired) < len(plain)
+
+    # JPEG inputs pass through untouched even when re-encoding is on.
+    jpg = tmp_path / "frame.jpg"
+    Image.new("RGB", (64, 64), color=(10, 200, 10)).save(jpg)
+    assert _image_data_url(str(jpg), force_jpeg=True).startswith(
+        "data:image/jpeg;base64,")
+
+
+def test_wire_jpeg_is_opt_in_on_the_client():
+    from src.omlx_client import InferenceClient
+
+    wired = InferenceClient.from_endpoint(
+        base_url="http://127.0.0.1:8000/v1", model="m", api_key=None,
+        wire_jpeg=True,
+    )
+    assert wired.wire_jpeg is True
+
+    default = InferenceClient.from_endpoint(
+        base_url="http://127.0.0.1:8000/v1", model="m", api_key=None,
+    )
+    assert default.wire_jpeg is False

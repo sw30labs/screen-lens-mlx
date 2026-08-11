@@ -72,7 +72,11 @@ pytest tests/test_pipeline.py::TestEmbedder::test_embed_text -v   # one test
 
 The codebase has two LangGraph `StateGraph` pipelines plus the straight-line transcribe path. They share one `ScreenLensConfig` and the provider-neutral `InferenceClient` in the legacy-named `omlx_client.py` module.
 
-Three front ends drive those pipelines — `cli.py` (Typer), `tui.py` (Textual), and `web/` (the command deck). All three build on `session.py`, which owns config loading, per-video slug allocation, role-aware inference wiring, and read-only run discovery. Put anything a second front end would otherwise copy there; the config/slug helpers were duplicated between the CLI and TUI before it existed.
+Two front ends drive those pipelines — `cli.py` (Typer) and `web/` (the command deck, the primary GUI). Both build on `session.py`, which owns config loading, per-video slug allocation, role-aware inference wiring, run-folder reuse, and read-only run discovery. Put anything a second front end would otherwise copy there; the config/slug helpers were duplicated between front ends before it existed.
+
+Run reuse: `find_reusable_run`/`reuse_video_run` let a re-run of the same video resume the newest matching run folder instead of re-paying the model cost. Each stage skips what its artifacts already cover — extraction (`frames/frames_meta.json`, guarded by video identity + extraction config), captions (per-frame `caption_*.json`), embeddings (collection count), OCR (`ocr/all_ocr.json` + per-frame files), and reconstruction Pass-1 notes (`output/segment_notes.json`, guarded by a captions sha1). `--fresh` opts out at the CLI; the deck resumes automatically.
+
+Cross-call efficiency: `search_node` gets its CLIP model from `get_shared_embedder` (one process-wide instance per model/device, lock-serialized for the threaded deck), so searches never reload OpenCLIP. Search and full-video summaries are cached per run folder in `summary_cache.json`, keyed by a sha1 of the model plus prompt inputs. `caption_frames` submits all pending frames to one pool with `batch_size` workers (no per-chunk barrier) and persists per-frame JSON through the `caption_batch` `on_result` callback. The OCR client is built with `wire_jpeg=True`: frames stay lossless PNG on disk, but the chat payload is an in-memory JPEG q92 re-encode, ~5–10× smaller.
 
 ### Model roles (`src/session.py`)
 
@@ -81,14 +85,14 @@ Two roles resolve separately against one endpoint:
 - **vision** — captioning (`captioner.py`) and OCR (`ocr.py`). Must be vision-capable.
 - **text** — search/full-video summaries, reconstruction plan/QA, transcript cleanup. Never sees an image.
 
-`text_role_captioning_config()` builds the text-role client from `config.reconstruction`; `pipeline.py` and `reconstruct.py` both go through it, so text work never lands on the vision model. On Spark both roles resolve to the single served vLLM checkpoint, making the split a no-op there. On Apple the oMLX defaults are `Qwen3.6-27B-bf16` for vision and `DeepSeek-V4-Flash-0731-MLX` for text.
+`text_role_captioning_config()` builds the text-role client from `config.reconstruction`; `pipeline.py` and `reconstruct.py` both go through it, so text work never lands on the vision model. On Spark both roles resolve to the single served vLLM checkpoint, making the split a no-op there. On Apple the oMLX defaults are `Qwen3.6-27B-bf16` for vision and `DeepSeek-V4-Flash-0731-MXFP4-MLX` for text.
 
-### Front end 3 — Web command deck (`src/web/`)
+### Web command deck (`src/web/`)
 
 Stdlib `http.server` only — the same ADR-008 pattern as contingency-atlas and book-buddy-2026: hand-rolled JSON handlers, one static page, no framework and no build step, so the GUI adds no dependency.
 
 - `server.py` — loopback-only bind plus a per-request loopback check on every `/api/` route. Run slugs, artifact names and frame names are contained *by name* (no separators, no dotfiles, resolved parent must match) rather than resolved, and frames/artifacts are restricted to known-safe suffixes so an `.env` sitting beside a transcript is not readable.
-- `runner.py` — one job at a time behind a lock (the pipelines share one model endpoint and one CLIP device). Pipeline `print()`/`logging` output is captured into a ring buffer the page tails, the same approach `tui.py` uses. `set_pipeline_override` is the test seam: `tests/test_web.py` exercises the whole job lifecycle without a model, GPU, or ffmpeg.
+- `runner.py` — one job at a time behind a lock (the pipelines share one model endpoint and one CLIP device). Pipeline `print()`/`logging` output is captured into a ring buffer the page tails. `set_pipeline_override` is the test seam: `tests/test_web.py` exercises the whole job lifecycle without a model, GPU, or ffmpeg.
 - `static/index.html` — the SPA. If you add an endpoint, `test_index_calls_only_real_endpoints` will catch a page that calls something the server does not serve.
 
 ### Pipeline 1 — Ingest / Search (`src/pipeline.py`)
@@ -183,7 +187,7 @@ data/<slug>/
 - **Reconstruction's output ceiling is the whole context, by design.** `_long_form_output_ceiling` hands `InferenceClient` the full model context so vLLM computes the exact remaining completion space per prompt. That is cheap on Spark and expensive on Apple Silicon: a single synthesis pass generating toward a 32K ceiling at ~6 tok/s on oMLX runs for over an hour before it either stops or trips `InferenceTruncatedError` and retries with less input. Budget for it, and prefer `summarize` when a full artifact rebuild is not what you actually want.
 - **Caption token budget is not free.** `CaptioningConfig.max_tokens` defaults to the full context. On a dense frame the model keeps generating past the real content and degenerates into a repetition loop (observed: `'E0000000…'` for thousands of tokens, tens of minutes per frame on oMLX). The repetition guards are honoured by both servers but do not bound runtime — a bounded budget does. The command deck exposes it per run and defaults to 1500.
 - **Text work must not land on the vision model.** Route it through `session.text_role_captioning_config()`, never `InferenceClient(config.captioning)` directly.
-- **Vet a text model against a real caption.** Captions are markdown with indented list items. `DeepSeek-V4-Flash-0731-MLX` under oMLX degenerates into its BOS token on exactly that shape (`\n   - ` is the minimal reproducer; length, backticks and the system turn are all irrelevant), so it cannot serve the text role even though it is a capable reasoner. `omlx_client.degenerate_repetition` catches the shape, the client warns, and summaries raise `InferenceDegenerateError` rather than saving it — never weaken that into a silent pass.
+- **Guard the text role against degenerate output.** Captions are markdown with indented list items, and `DeepSeek-V4-Flash-0731-MLX` (the older 8-bit build) under oMLX degenerated into its BOS token on exactly that shape (`\n   - ` is the minimal reproducer; length, backticks and the system turn are all irrelevant). The default text model is now `DeepSeek-V4-Flash-0731-MXFP4-MLX`, protected by two guards: `mishandles_system_role` folds the system prompt into the user turn for `deepseek-v4` ids (the verified fix), and `omlx_client.degenerate_repetition` catches any output that still degenerates — the client warns, and summaries raise `InferenceDegenerateError` rather than saving it. Never weaken either guard into a silent pass.
 - **DGX concurrency stays at two.** The bundled vLLM service admits two sequences and shares one 128 GB unified-memory pool with OpenCLIP and the OS. Do not raise it casually. oMLX may serialize requests for a loaded model; tune Apple concurrency to the host.
 - **Do not start two port-8000 stacks.** The Spark helper reuses DigitalTwin's exact-model endpoint and only manages containers created by this repository. See `docs/DGX_SPARK.md`.
 

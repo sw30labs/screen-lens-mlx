@@ -367,11 +367,14 @@ def resolve_role_api_key(config: Any, *preferred_names: str) -> str | None:
 # checkpoints, because a vision model is wasted on text reasoning and a text
 # model cannot see frames at all.
 RECOMMENDED_OCR_MODEL = "Qwen3.6-27B-bf16"
-# Qwen3.6 serves the text role too. A dedicated text model is welcome here, but
-# it must survive ScreenLens's actual inputs: captions are markdown with
-# indented list items, and DeepSeek-V4-Flash under oMLX emits its BOS token to
-# the token limit on exactly that shape (see degenerate_repetition).
-RECOMMENDED_TEXT_MODEL = "Qwen3.6-27B-bf16"
+# DeepSeek-V4-Flash (MXFP4) serves the text role: reasoning is what this role
+# does, and it never sees an image. Two guards make this safe on ScreenLens's
+# actual inputs (captions are markdown with indented list items): the
+# deepseek-v4 system-role folding in mishandles_system_role avoids the BOS
+# loop verified on the older -0731-MLX build, and degenerate_repetition
+# refuses any output that still degenerates instead of saving it. Fall back to
+# "Qwen3.6-27B-bf16" to keep one checkpoint resident for both roles.
+RECOMMENDED_TEXT_MODEL = "DeepSeek-V4-Flash-0731-MXFP4-MLX"
 
 
 def resolve_ocr_model(config) -> str:
@@ -492,8 +495,27 @@ def strip_thinking(text: str) -> str:
     return cleaned.strip()
 
 
-def _image_data_url(path: str) -> str:
+# Quality for JPEG wire re-encodes: high enough that text stays crisp for the
+# vision model, small enough to shrink a multi-MB screenshot PNG ~5-10×.
+_WIRE_JPEG_QUALITY = 92
+
+
+def _image_data_url(path: str, force_jpeg: bool = False) -> str:
     suffix = Path(path).suffix.lower()
+    if force_jpeg and suffix not in (".jpg", ".jpeg"):
+        # Verbatim OCR stores frames as lossless PNG (multi-MB each), but the
+        # chat wire format doesn't need lossless pixels. Re-encode in memory —
+        # the on-disk frame stays PNG for the deterministic backstop and
+        # human review; only the payload shrinks.
+        import io
+
+        from PIL import Image
+
+        with Image.open(path) as img:
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=_WIRE_JPEG_QUALITY)
+        encoded = base64.b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
     mime = {
         ".jpg": "image/jpeg",
         ".jpeg": "image/jpeg",
@@ -539,6 +561,7 @@ class OpenAICompatibleClient:
         self.context_size = resolve_inference_context(config)
         self._default_max_tokens = config.max_tokens
         self._default_temperature = config.temperature
+        self.wire_jpeg = False
 
     @classmethod
     def from_endpoint(
@@ -552,11 +575,13 @@ class OpenAICompatibleClient:
         context_size: int = 32768,
         default_max_tokens: int = 32768,
         default_temperature: float = 0.0,
+        wire_jpeg: bool = False,
     ) -> "OpenAICompatibleClient":
         """Build a client directly from endpoint params (no CaptioningConfig).
 
         Used by the verbatim OCR pass (vision model) and the reconstruction pass
-        (text model), which keep their own config objects.
+        (text model), which keep their own config objects. ``wire_jpeg``
+        re-encodes non-JPEG images to JPEG on the wire (see _image_data_url).
         """
         self = cls.__new__(cls)
         self.config = None
@@ -568,6 +593,7 @@ class OpenAICompatibleClient:
         self.context_size = context_size
         self._default_max_tokens = default_max_tokens
         self._default_temperature = default_temperature
+        self.wire_jpeg = wire_jpeg
         return self
 
     def model_supports_vision(self) -> bool | None:
@@ -600,7 +626,10 @@ class OpenAICompatibleClient:
         if images:
             user_content = [{"type": "text", "text": user_prompt}]
             user_content.extend(
-                {"type": "image_url", "image_url": {"url": _image_data_url(path)}}
+                {
+                    "type": "image_url",
+                    "image_url": {"url": _image_data_url(path, force_jpeg=self.wire_jpeg)},
+                }
                 for path in images
             )
         else:

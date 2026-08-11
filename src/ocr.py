@@ -65,6 +65,9 @@ class VerbatimOCR:
             context_size=resolve_role_context(config),
             default_max_tokens=config.max_tokens,
             default_temperature=config.temperature,
+            # Frames stay lossless PNG on disk; only the wire payload is
+            # re-encoded to JPEG (multi-MB → ~200KB per request).
+            wire_jpeg=True,
         )
         self._extra = {
             "repetition_penalty": config.repetition_penalty,

@@ -137,7 +137,7 @@ Examples:
   ./setup_and_run_dgx.sh setup
   ./setup_and_run_dgx.sh llm-up
   ./setup_and_run_dgx.sh smoke
-  ./setup_and_run_dgx.sh run        # launches the TUI
+  ./setup_and_run_dgx.sh run        # launches the web command deck
   ./setup_and_run_dgx.sh run ingest input-videos/demo.mov
 
 Supported .env/export overrides:
@@ -455,8 +455,8 @@ cmd_setup() {
     --index-url "${TORCH_INDEX_URL}" \
     "torch==${TORCH_VERSION}" \
     "torchvision==${TORCHVISION_VERSION}"
-  note "installing ScreenLens development and TUI dependencies"
-  "${python}" -m pip install -e "${REPO_ROOT}[dev,tui]"
+  note "installing ScreenLens development dependencies"
+  "${python}" -m pip install -e "${REPO_ROOT}[dev]"
 
   note "running CUDA, torchvision, and OpenCLIP preflight"
   "${python}" - "${TORCH_VERSION}" "${TORCHVISION_VERSION}" <<'PY'
@@ -672,7 +672,7 @@ cmd_run() {
     shift
   fi
   if [[ $# -eq 0 ]]; then
-    set -- tui
+    set -- serve --no-browser
   fi
 
   # Force the bounded DGX execution profile. The vLLM server admits at most two

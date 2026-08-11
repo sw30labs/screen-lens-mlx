@@ -7,8 +7,7 @@ serving recipe. The HTTP layer polls job status; the worker thread drives the
 LangGraph pipelines directly.
 
 The pipelines report progress by printing and by ``logging``, so the worker
-captures both into a ring buffer that the dashboard tails. This mirrors what
-``tui.py`` already does for the terminal UI.
+captures both into a ring buffer that the dashboard tails.
 
 Author: Nic Cravino — ScreenLens
 """
@@ -34,11 +33,15 @@ from ..session import (
     apply_video_slug,
     discover_runs,
     endpoint_status,
+    extraction_meta_matches,
+    find_reusable_run,
     load_config,
     model_roles,
     point_config_at_data_dir,
     read_artifact,
+    reuse_video_run,
     run_snapshot,
+    transcribe_run_matches,
 )
 
 __all__ = [
@@ -276,7 +279,7 @@ class _EventLogHandler(logging.Handler):
     def emit(self, record: logging.LogRecord) -> None:
         try:
             message = record.getMessage()
-        except Exception:  # pragma: no cover — defensive, mirrors tui.py
+        except Exception:  # pragma: no cover — defensive
             return
         kind = "error" if record.levelno >= logging.ERROR else "log"
         _emit(kind, f"{record.name}: {message}"[:400])
@@ -424,6 +427,27 @@ def _publish_run(config: ScreenLensConfig) -> None:
         _LIVE["data_dir"] = str(config.data_dir)
 
 
+def _prepare_run_folder(
+    config: ScreenLensConfig,
+    video: Path,
+    *,
+    fresh: bool,
+    required: str,
+    matches,
+) -> tuple[str, bool]:
+    """Reuse the newest matching prior run folder for ``video`` when possible.
+
+    Same resume semantics as the CLI: stages whose artifacts already exist are
+    skipped, so re-running a pipeline from the deck does not re-pay the model
+    cost. Falls back to a fresh timestamped slug.
+    """
+    if not fresh:
+        reuse_dir = find_reusable_run(config, video, required)
+        if reuse_dir is not None and matches(reuse_dir, video, config):
+            return reuse_video_run(config, video, reuse_dir), True
+    return apply_video_slug(config, video), False
+
+
 def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
     from ..config import ExtractionStrategy
     from ..pipeline import build_ingest_graph
@@ -438,9 +462,14 @@ def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, A
     if params.get("device"):
         config.embedding.device = str(params["device"])
 
-    slug = apply_video_slug(config, video)
+    slug, reused = _prepare_run_folder(
+        config, video,
+        fresh=bool(params.get("fresh")),
+        required="frames/frames_meta.json",
+        matches=extraction_meta_matches,
+    )
     _publish_run(config)
-    _emit("stage", f"ingest {video.name} → {slug}")
+    _emit("stage", f"ingest {video.name} → {slug}" + (" (resuming)" if reused else ""))
 
     result = build_ingest_graph().invoke(
         {"video_path": str(video), "config": config.model_dump()}
@@ -464,9 +493,14 @@ def _run_transcribe(params: dict[str, Any], config: ScreenLensConfig) -> dict[st
     config.reconstruction.enabled = bool(params.get("cleanup"))
     config.ocr.deterministic_backstop = bool(params.get("deterministic"))
 
-    slug = apply_video_slug(config, video)
+    slug, reused = _prepare_run_folder(
+        config, video,
+        fresh=bool(params.get("fresh")),
+        required="ocr",
+        matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
+    )
     _publish_run(config)
-    _emit("stage", f"transcribe {video.name} → {slug}")
+    _emit("stage", f"transcribe {video.name} → {slug}" + (" (resuming)" if reused else ""))
 
     result = transcribe_video(str(video), config, config.data_dir)
     return {"run_slug": slug, "data_dir": str(config.data_dir), **result}

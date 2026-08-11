@@ -5,6 +5,7 @@ Generates visual and text embeddings using OpenCLIP for semantic search.
 Supports both image embedding (for frames) and text embedding (for queries).
 """
 import logging
+import threading
 import numpy as np
 from pathlib import Path
 from typing import Optional
@@ -29,6 +30,8 @@ class CLIPEmbedder:
         self._model = None
         self._preprocess = None
         self._tokenizer = None
+        # Shared instances serve the threaded web server; serialize model use.
+        self._lock = threading.Lock()
 
     def _load_model(self):
         """Lazy-load the CLIP model."""
@@ -52,7 +55,7 @@ class CLIPEmbedder:
 
         print(f"Loading OpenCLIP model {self.config.model_name} on {device}...")
         # The configured checkpoint is public. Newer Hub servers emit an
-        # advisory warning (often twice under TUI log forwarding) without a
+        # advisory warning (often twice under log forwarding) without a
         # token even though the download is valid. Actual download, auth, and
         # rate-limit failures still propagate normally.
         hub_logger = logging.getLogger("huggingface_hub.utils._http")
@@ -76,6 +79,10 @@ class CLIPEmbedder:
 
         Returns: numpy array of shape (N, embedding_dim)
         """
+        with self._lock:
+            return self._embed_images(image_paths)
+
+    def _embed_images(self, image_paths: list[str]) -> np.ndarray:
         import torch
         from PIL import Image
 
@@ -112,6 +119,10 @@ class CLIPEmbedder:
 
         Returns: numpy array of shape (N, embedding_dim)
         """
+        with self._lock:
+            return self._embed_text(queries)
+
+    def _embed_text(self, queries: list[str]) -> np.ndarray:
         import torch
 
         self._load_model()
@@ -127,6 +138,29 @@ class CLIPEmbedder:
     @property
     def embedding_dim(self) -> int:
         """Return the embedding dimensionality."""
-        self._load_model()
-        # ViT-B-32 = 512, ViT-L-14 = 768
-        return self._model.visual.output_dim
+        with self._lock:
+            self._load_model()
+            # ViT-B-32 = 512, ViT-L-14 = 768
+            return self._model.visual.output_dim
+
+
+# ── Process-wide shared instances ────────────────────────────────────────────
+#
+# Loading OpenCLIP takes seconds. The web server answers every search in one
+# long-lived process, and the CLI search loop walks one pipeline per collection
+# — constructing a fresh embedder per call re-paid the load each time. Cache
+# one instance per resolved model/device and reuse it.
+
+_SHARED: dict[tuple, "CLIPEmbedder"] = {}
+_SHARED_LOCK = threading.Lock()
+
+
+def get_shared_embedder(config: EmbeddingConfig) -> "CLIPEmbedder":
+    """Return the process-wide embedder for this model/device, creating it once."""
+    key = (config.model_name, config.pretrained, config.device)
+    with _SHARED_LOCK:
+        embedder = _SHARED.get(key)
+        if embedder is None:
+            embedder = CLIPEmbedder(config)
+            _SHARED[key] = embedder
+    return embedder

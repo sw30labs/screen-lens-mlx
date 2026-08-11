@@ -11,6 +11,8 @@ Orchestrates the full ScreenLens workflow:
 
 Uses LangGraph's StateGraph for explicit state management and checkpointing.
 """
+import hashlib
+import json
 import time
 from pathlib import Path
 from typing import TypedDict
@@ -20,7 +22,7 @@ from langgraph.graph import StateGraph, START, END
 from .config import ScreenLensConfig
 from .frame_extractor import extract_frames, get_video_metadata
 from .captioner import caption_frames
-from .embedder import CLIPEmbedder
+from .embedder import CLIPEmbedder, get_shared_embedder
 from .omlx_client import (
     InferenceClient,
     InferenceDegenerateError,
@@ -28,7 +30,7 @@ from .omlx_client import (
     resolve_inference_context,
     resolve_inference_model,
 )
-from .session import text_role_captioning_config
+from .session import load_cached_frames, text_role_captioning_config
 from .vector_store import ScreenLensVectorStore
 
 
@@ -81,7 +83,26 @@ def ingest_node(state: ScreenLensState) -> dict:
     print(f"{'='*60}")
 
     metadata = get_video_metadata(video_path)
-    frames = extract_frames(video_path, output_dir, config.frame_extraction)
+
+    # A reused run folder carries the prior extraction alongside the video
+    # identity and extraction config that produced it; skip the decode pass
+    # when both match.
+    frames = load_cached_frames(config.data_dir, Path(video_path), config)
+    if frames is not None:
+        print(f"Reusing {len(frames)} previously extracted frames")
+    else:
+        frames = extract_frames(video_path, output_dir, config.frame_extraction)
+        try:
+            video_size: int | None = Path(video_path).stat().st_size
+        except OSError:
+            video_size = None
+        meta_file = config.data_dir / "frames" / "frames_meta.json"
+        meta_file.write_text(json.dumps({
+            "video": str(Path(video_path).resolve()),
+            "video_size": video_size,
+            "extraction": config.frame_extraction.model_dump(mode="json"),
+            "frames": frames,
+        }, indent=2), encoding="utf-8")
 
     elapsed = time.time() - t0
     print(f"Extracted {len(frames)} frames in {elapsed:.1f}s")
@@ -138,13 +159,31 @@ def embed_node(state: ScreenLensState) -> dict:
     print(f"      Model: {config.embedding.model_name}")
     print(f"{'='*60}")
 
+    store = ScreenLensVectorStore(config.vector_db)
+    total = len(state["captioned_frames"])
+    existing = store.count()
+
+    # A reused run folder may already hold this video's embeddings — skip the
+    # CLIP load and the embed pass entirely. A partial store means a previous
+    # run died mid-embed; ids are deterministic, so rebuild it cleanly.
+    if total > 0 and existing >= total:
+        print(f"Vector store already holds {existing} frame(s) — skipping embedding")
+        elapsed = time.time() - t0
+        return {
+            "embeddings_shape": [existing],
+            "stage": "embedded",
+            "elapsed_seconds": {**state.get("elapsed_seconds", {}), "embed": round(elapsed, 2)},
+        }
+    if existing:
+        print(f"Vector store holds a partial {existing}/{total} frame(s) — re-embedding all")
+        store.reset()
+
     embedder = CLIPEmbedder(config.embedding)
 
     image_paths = [f["path"] for f in state["captioned_frames"]]
     embeddings = embedder.embed_images(image_paths)
 
     print(f"\nStoring in ChromaDB ({config.vector_db.collection_name})...")
-    store = ScreenLensVectorStore(config.vector_db)
     store.add_frames(state["captioned_frames"], embeddings)
 
     elapsed = time.time() - t0
@@ -170,7 +209,7 @@ def search_node(state: ScreenLensState) -> dict:
     print(f"[SEARCH] Query: '{query}'")
     print(f"{'='*60}")
 
-    embedder = CLIPEmbedder(config.embedding)
+    embedder = get_shared_embedder(config.embedding)
     store = ScreenLensVectorStore(config.vector_db)
 
     query_emb = embedder.embed_text([query])[0]
@@ -189,6 +228,32 @@ def search_node(state: ScreenLensState) -> dict:
         "stage": "searched",
         "elapsed_seconds": {**state.get("elapsed_seconds", {}), "search": round(elapsed, 2)},
     }
+
+
+# ── Summary cache ────────────────────────────────────────────────────────────
+#
+# Summaries are pure functions of (model, prompt inputs), and an LLM answer is
+# the most expensive thing a repeated search re-pays. Cache per run folder,
+# keyed by a hash of everything that shapes the answer.
+
+
+def _read_summary_cache(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _write_summary_cache(path: Path, cache: dict) -> None:
+    try:
+        path.write_text(json.dumps(cache, indent=2), encoding="utf-8")
+    except Exception as exc:
+        print(f"Warning: could not write summary cache {path}: {exc}")
+
+
+def _summary_key(namespace: str, *parts) -> str:
+    digest = hashlib.sha1("\0".join(str(p) for p in parts).encode("utf-8"))
+    return f"{namespace}:{digest.hexdigest()}"
 
 
 def summarize_node(state: ScreenLensState) -> dict:
@@ -225,6 +290,28 @@ def summarize_node(state: ScreenLensState) -> dict:
     )
     user = f"Question: {query}\n\nVideo frame descriptions:\n\n{context}"
 
+    # Cache hit = same question over the same retrieved frames by the same
+    # model; the run folder's cache sits next to its ChromaDB directory.
+    if config.captioning.backend.value == "ollama":
+        model_name = config.search.summarization_model
+    else:
+        model_name = resolve_inference_model(text_role_captioning_config(config))
+    cache_path = (
+        Path(config.vector_db.persist_directory).resolve().parent / "summary_cache.json"
+    )
+    cache_key = _summary_key("search", model_name, system, user)
+    cache = _read_summary_cache(cache_path)
+    if cache_key in cache:
+        elapsed = time.time() - t0
+        print("\nSummary cache hit — reusing the stored answer")
+        summary = cache[cache_key]["summary"]
+        print(f"\n{summary}")
+        return {
+            "summary": summary,
+            "stage": "summarized",
+            "elapsed_seconds": {**state.get("elapsed_seconds", {}), "summarize": round(elapsed, 2)},
+        }
+
     if config.captioning.backend.value == "ollama":
         from langchain_ollama import ChatOllama
 
@@ -242,6 +329,9 @@ def summarize_node(state: ScreenLensState) -> dict:
             max_tokens=2048,
             temperature=0.3,
         )
+
+    cache[cache_key] = {"query": query, "summary": summary}
+    _write_summary_cache(cache_path, cache)
 
     elapsed = time.time() - t0
     print(f"\nSummary generated in {elapsed:.1f}s")
@@ -436,6 +526,24 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     model_context = resolve_inference_context(text_config)
     print(f"Using {model.backend.value} model: {model.model} at {model.base_url}")
 
+    # Same captions + same text model → same summary; re-running summarize on
+    # a finished run is then free. Cache lives in the run's data folder.
+    cache_path = Path(config.data_dir) / "summary_cache.json"
+    cache_key = _summary_key(
+        "full", model.model, model_context, json.dumps(captioned, sort_keys=True),
+    )
+    cache = _read_summary_cache(cache_path)
+    if cache_key in cache:
+        elapsed = time.time() - t0
+        print("\nSummary cache hit — reusing the stored full-video summary")
+        summary = cache[cache_key]["summary"]
+        print(f"\n{summary}")
+        return {
+            "summary": summary,
+            "stage": "summarized",
+            "elapsed_seconds": {**state.get("elapsed_seconds", {}), "summarize": round(elapsed, 2)},
+        }
+
     # ── Compute chunking strategy ────────────────────────────────────────
     strategy = _compute_chunk_strategy(captioned, model_context)
 
@@ -478,6 +586,9 @@ def summarize_all_node(state: ScreenLensState) -> dict:
         )
 
         summary = _inference_text_generate(model, system, user, max_tokens=4096)
+
+        cache[cache_key] = {"summary": summary}
+        _write_summary_cache(cache_path, cache)
 
         elapsed = time.time() - t0
         print(f"\nFull-video summary generated in {elapsed:.1f}s")
@@ -549,6 +660,9 @@ def summarize_all_node(state: ScreenLensState) -> dict:
     )
 
     summary = _inference_text_generate(model, system, user, max_tokens=4096)
+
+    cache[cache_key] = {"summary": summary}
+    _write_summary_cache(cache_path, cache)
 
     elapsed = time.time() - t0
     print(f"\nFull-video summary generated in {elapsed:.1f}s")

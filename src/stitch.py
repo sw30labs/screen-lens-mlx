@@ -114,15 +114,34 @@ def _canon_ids(norm_a: list[str], norm_b: list[str], fuzzy: float) -> tuple[list
     by exact equality, so we first collapse near-duplicate lines to one id. This
     lets ``SequenceMatcher`` align the two frames while tolerating both OCR
     flicker (fuzzy) AND inserted/dropped lines (difflib's matching blocks).
+
+    Performance: most lines repeat *exactly* across consecutive frames, so an
+    exact-match dict answers those in O(1). A line already in ``canons`` always
+    maps to its own index — when it was added, no earlier canon reached
+    ``fuzzy``, and ``ratio(s, s) == 1.0`` does — so the dict is precisely
+    equivalent to the scan. For the remaining lines, a length gate skips
+    candidates that cannot reach the threshold: ``ratio <= 2*min/(la+lb)``, so
+    ``|la-lb| * fuzzy > 2*min*(1-fuzzy)`` makes a match impossible. First-match
+    order is unchanged, so results are identical to the naive scan.
     """
     canons: list[str] = []
+    exact: dict[str, int] = {}
 
     def get_id(s: str) -> int:
         if not s:
             return -1
+        hit = exact.get(s)
+        if hit is not None:
+            return hit
+        ls = len(s)
         for idx, c in enumerate(canons):
+            lc = len(c)
+            if abs(ls - lc) * fuzzy > 2 * min(ls, lc) * (1 - fuzzy):
+                continue
             if SequenceMatcher(None, s, c).ratio() >= fuzzy:
+                exact[s] = idx
                 return idx
+        exact[s] = len(canons)
         canons.append(s)
         return len(canons) - 1
 
