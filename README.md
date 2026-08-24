@@ -121,7 +121,7 @@ python -m src.cli ingest video.mov \
   --batch-size 2
 ```
 
-`--vllm-url`, `--vllm-model`, and `--vllm-api-key` are provider-specific aliases; the existing `--omlx-*` spellings remain compatible. `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, and `SCREENLENS_BATCH_SIZE` override platform defaults. Provider credentials and models can also come from `VLLM_*`, `MLX_*`, or `OMLX_*` variables as appropriate.
+`--vllm-url`, `--vllm-model`, and `--vllm-api-key` are provider-specific aliases; the existing `--omlx-*` spellings remain compatible. `SCREENLENS_BACKEND`, `SCREENLENS_DEVICE`, `SCREENLENS_BATCH_SIZE`, `SCREENLENS_CAPTION_MAX_TOKENS`, `SCREENLENS_STRATEGY`, `SCREENLENS_FPS`, and `SCREENLENS_SAMPLE_FPS` override platform defaults. The command deck reads those same values for its form — they are not hardcoded in the page. Provider credentials and models can also come from `VLLM_*`, `MLX_*`, or `OMLX_*` variables as appropriate.
 
 ### Model Roles
 
@@ -163,6 +163,11 @@ and the command deck's vision selector only offers models that can see.
 # Uses vLLM/CUDA on DGX Spark or oMLX/MPS on Apple Silicon.
 python -m src.cli ingest "video.mov"
 
+# No path: every file in ./input, oldest recording first. Already-successful
+# ingestions are skipped. Run folders are named from the content, not the
+# "Screen Recording …" timestamp.
+python -m src.cli ingest
+
 # Optional Ollama captioning fallback.
 python -m src.cli ingest "video.mov" --backend ollama --strategy fixed_fps --fps 1
 
@@ -173,9 +178,9 @@ python -m src.cli search "What application is shown?" --data-dir ./data --top-k 
 python -m src.cli run "video.mov" "Summarize the workflow"
 ```
 
-Search summarization follows the configured platform backend; it does not require Ollama unless Ollama was explicitly selected. Each ingestion creates `data/<stem>_<YYYYMMDD_HHMMSS>/` with independent frames, captions, and ChromaDB data.
+Search summarization follows the configured platform backend; it does not require Ollama unless Ollama was explicitly selected. Each ingestion writes `data/<content-slug>_<recording-clock>/` once captions exist (a temporary filename-based folder is used until then). Identity lives in `output/run.json`, so a renamed folder still matches the source file.
 
-Re-running a pipeline on the same video resumes the newest prior run instead of paying for the same work twice: ingestion reuses the extracted frames, any per-frame captions already written, and a populated vector store; transcription reuses cached OCR. Resume only engages when the run's stored video path/size and extraction config still match — pass `--fresh` to force a new run folder (supported by `ingest`, `run`, `batch`, and `transcribe`; the web deck resumes automatically).
+An already-successful ingest (`all_captions.json` + Chroma store) or transcribe (`transcribe_meta.json`) of the same file is skipped entirely. Partial runs still resume: extracted frames, per-frame captions, and cached OCR are reused. `--fresh` forces a new run folder (`ingest`, `run`, `batch`, `transcribe`; the deck follows the same rules). The command deck's empty video field means "all of `./input`".
 
 Repeated work is avoided at other layers too: the CLIP embedder is a process-wide shared instance, so the web deck and multi-collection searches load OpenCLIP once instead of per query; search and full-video summaries are cached per run folder in `summary_cache.json` (keyed by model + prompt content); captioning keeps all pending frames in flight in a single pool with `batch_size` workers rather than stalling at each chunk boundary; and verbatim OCR sends frames to the server as in-memory JPEG q92 re-encodes — on-disk frames stay lossless PNG — shrinking multi-MB payloads roughly 5–10×.
 
@@ -285,7 +290,7 @@ All settings live in `src/config.py` as Pydantic models. Key parameters:
 | `captioning.omlx_base_url` | http://127.0.0.1:8000/v1 | Apple oMLX URL; root/dashboard URLs are normalized |
 | `captioning.omlx_model` | null | Falls back to `MLX_MODEL`/`OMLX_MODEL`/`LLM_MODEL`, then `default` |
 | `captioning.batch_size` | 2 DGX / 4 Apple | Concurrent direct-server caption requests |
-| `captioning.max_tokens` | 32768 | Requested caption ceiling; vLLM uses the context remaining after image/prompt tokens |
+| `captioning.max_tokens` | 32768 / `SCREENLENS_CAPTION_MAX_TOKENS` | Requested caption ceiling; vLLM uses the context remaining after image/prompt tokens when this equals the served context |
 | `captioning.retry_attempts` | 1 | Per-frame retries after a direct caption request fails |
 | `captioning.retry_max_tokens` | 2048 | Bounded retry ceiling that prevents malformed generations from consuming another full caption budget |
 | `captioning.repetition_penalty` | 1.05 | Discourage pathological long caption loops |

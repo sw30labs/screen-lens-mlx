@@ -28,20 +28,31 @@ from typing import Any, Callable
 
 from ..config import ScreenLensConfig
 from ..session import (
-    VIDEO_SUFFIXES,
+    DEFAULT_INPUT_FOLDER,
+    apply_content_name,
     apply_direct_inference,
     apply_video_slug,
+    content_excerpt,
     discover_runs,
     endpoint_status,
     extraction_meta_matches,
     find_reusable_run,
+    find_successful_run,
+    form_defaults,
+    infer_content_slug,
+    list_videos_chronological,
+    text_slug_generate,
     load_config,
     model_roles,
     point_config_at_data_dir,
     read_artifact,
+    read_run_identity,
+    resolve_video_queue,
     reuse_video_run,
     run_snapshot,
     transcribe_run_matches,
+    video_recorded_at,
+    write_run_identity,
 )
 
 __all__ = [
@@ -54,6 +65,7 @@ __all__ = [
     "current_run",
     "probe_endpoint",
     "roles",
+    "defaults",
     "list_runs",
     "snapshot",
     "artifact",
@@ -146,6 +158,11 @@ def roles(config_path: str | None = None) -> dict[str, Any]:
     return model_roles(load_config(config_path))
 
 
+def defaults(config_path: str | None = None) -> dict[str, Any]:
+    """Resolved form defaults from config / ``.env``."""
+    return form_defaults(load_config(config_path))
+
+
 def list_runs(data_dir: str | None = None) -> list[dict[str, Any]]:
     return discover_runs(data_dir or "./data")
 
@@ -171,15 +188,27 @@ def resolve_run(slug: str, data_dir: str | None = None) -> Path | None:
     return folder
 
 
-def list_videos(folder: str) -> list[dict[str, Any]]:
-    """List video files in a folder so the dashboard can offer a picker."""
-    path = Path(folder).expanduser()
-    if not path.is_dir():
-        return []
+def list_videos(folder: str, data_dir: str | None = None) -> list[dict[str, Any]]:
+    """List video files in a folder so the dashboard can offer a picker.
+
+    Oldest recording first. ``ingest_done`` / ``transcribe_done`` reflect a
+    fully successful prior run of that file, so the picker can mark them.
+    """
+    root = Path(data_dir or "./data")
     out = []
-    for p in sorted(path.iterdir()):
-        if p.is_file() and p.suffix.lower() in VIDEO_SUFFIXES:
-            out.append({"name": p.name, "path": str(p), "size": p.stat().st_size})
+    for path in list_videos_chronological(folder):
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        out.append({
+            "name": path.name,
+            "path": str(path),
+            "size": size,
+            "recorded_at": video_recorded_at(path).isoformat(),
+            "ingest_done": find_successful_run(root, path, "ingest") is not None,
+            "transcribe_done": find_successful_run(root, path, "transcribe") is not None,
+        })
     return out
 
 
@@ -333,11 +362,15 @@ def start_job(params: dict[str, Any]) -> tuple[str | None, str | None]:
         return None, f"pipeline must be one of: {', '.join(PIPELINES)}"
 
     if pipeline in ("ingest", "transcribe"):
-        video = str(params.get("video_path") or "").strip()
-        if not video:
-            return None, "video_path is required"
-        if not Path(video).expanduser().is_file():
-            return None, f"video not found: {video}"
+        raw = str(params.get("video_path") or "").strip()
+        folder = str(params.get("input_folder") or DEFAULT_INPUT_FOLDER)
+        try:
+            queue = resolve_video_queue(raw or None, default_folder=folder)
+        except FileNotFoundError as exc:
+            return None, str(exc)
+        if not queue:
+            return None, f"no video files in {folder}"
+        params["video_queue"] = [str(p) for p in queue]
     if pipeline == "summarize" and not str(params.get("run_slug") or "").strip():
         return None, "run_slug is required for summarize"
     if pipeline in ("reconstruct", "summarize"):
@@ -461,11 +494,37 @@ def _prepare_run_folder(
     return apply_video_slug(config, video), False
 
 
+def _video_queue(params: dict[str, Any]) -> list[Path]:
+    queued = params.get("video_queue")
+    if queued:
+        return [Path(p) for p in queued]
+    raw = str(params.get("video_path") or "").strip()
+    folder = str(params.get("input_folder") or DEFAULT_INPUT_FOLDER)
+    return resolve_video_queue(raw or None, default_folder=folder)
+
+
+def _finish_named_run(
+    config: ScreenLensConfig,
+    video: Path,
+    *,
+    kind: str,
+    generate,
+) -> str:
+    """Mark success, infer a content slug, rename the folder if we got one."""
+    excerpt = content_excerpt(config.data_dir)
+    slug_base = infer_content_slug(excerpt, generate=generate)
+    new_slug = apply_content_name(config, video, slug_base)
+    write_run_identity(config.data_dir, {"pipeline": kind, "status": "success"})
+    _publish_run(config)
+    if slug_base:
+        _emit("stage", f"named {video.name} → {new_slug}")
+    return new_slug
+
+
 def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
     from ..config import ExtractionStrategy
     from ..pipeline import build_ingest_graph
 
-    video = Path(str(params["video_path"])).expanduser().resolve()
     if params.get("strategy"):
         config.frame_extraction.strategy = ExtractionStrategy(str(params["strategy"]))
     if params.get("fps"):
@@ -475,48 +534,149 @@ def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, A
     if params.get("device"):
         config.embedding.device = str(params["device"])
 
-    slug, reused = _prepare_run_folder(
-        config, video,
-        fresh=bool(params.get("fresh")),
-        required="frames/frames_meta.json",
-        matches=extraction_meta_matches,
-    )
-    _publish_run(config)
-    _emit("stage", f"ingest {video.name} → {slug}" + (" (resuming)" if reused else ""))
+    videos = _video_queue(params)
+    data_root = Path(params.get("data_dir") or "./data")
+    fresh = bool(params.get("fresh"))
+    generate = text_slug_generate(config)
+    if generate is None:
+        _emit("log", "content naming unavailable; using caption heuristic")
 
-    result = build_ingest_graph().invoke(
-        {"video_path": str(video), "config": config.model_dump()}
-    )
-    return {
-        "run_slug": slug,
-        "data_dir": str(config.data_dir),
-        "collection": config.vector_db.collection_name,
-        "num_frames": result.get("num_frames"),
-        "embeddings_shape": result.get("embeddings_shape"),
-        "elapsed_seconds": result.get("elapsed_seconds"),
-    }
+    results: list[dict[str, Any]] = []
+    graph = build_ingest_graph()
+    for index, video in enumerate(videos, 1):
+        config.data_dir = data_root
+        point_config_at_data_dir(config, data_root)
+        if not fresh:
+            done = find_successful_run(data_root, video, "ingest")
+            if done is not None:
+                _emit("stage", f"[{index}/{len(videos)}] skip {video.name} — already ingested as {done.name}")
+                results.append({
+                    "video": video.name,
+                    "status": "skipped",
+                    "run_slug": done.name,
+                    "data_dir": str(done),
+                })
+                continue
+        slug, reused = _prepare_run_folder(
+            config, video,
+            fresh=fresh,
+            required="frames/frames_meta.json",
+            matches=extraction_meta_matches,
+        )
+        _publish_run(config)
+        _emit("stage", f"[{index}/{len(videos)}] ingest {video.name} → {slug}" + (" (resuming)" if reused else ""))
+        try:
+            result = graph.invoke(
+                {"video_path": str(video), "config": config.model_dump()}
+            )
+            slug = _finish_named_run(config, video, kind="ingest", generate=generate)
+            results.append({
+                "video": video.name,
+                "status": "done",
+                "run_slug": slug,
+                "data_dir": str(config.data_dir),
+                "num_frames": result.get("num_frames"),
+                "embeddings_shape": result.get("embeddings_shape"),
+                "elapsed_seconds": result.get("elapsed_seconds"),
+            })
+        except Exception as exc:
+            write_run_identity(config.data_dir, {"status": "error", "error": str(exc)[:400]})
+            _emit("error", f"{video.name}: {exc}")
+            results.append({
+                "video": video.name,
+                "status": "error",
+                "run_slug": Path(config.data_dir).name,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return _queue_result("ingest", videos, results)
 
 
 def _run_transcribe(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
     from ..transcribe import transcribe_video
 
-    video = Path(str(params["video_path"])).expanduser().resolve()
     if params.get("sample_fps"):
         config.frame_selection.sample_fps = float(params["sample_fps"])
     config.reconstruction.enabled = bool(params.get("cleanup"))
     config.ocr.deterministic_backstop = bool(params.get("deterministic"))
 
-    slug, reused = _prepare_run_folder(
-        config, video,
-        fresh=bool(params.get("fresh")),
-        required="ocr",
-        matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
-    )
-    _publish_run(config)
-    _emit("stage", f"transcribe {video.name} → {slug}" + (" (resuming)" if reused else ""))
+    videos = _video_queue(params)
+    data_root = Path(params.get("data_dir") or "./data")
+    fresh = bool(params.get("fresh"))
+    generate = text_slug_generate(config)
+    if generate is None:
+        _emit("log", "content naming unavailable; using transcript heuristic")
 
-    result = transcribe_video(str(video), config, config.data_dir)
-    return {"run_slug": slug, "data_dir": str(config.data_dir), **result}
+    results: list[dict[str, Any]] = []
+    for index, video in enumerate(videos, 1):
+        point_config_at_data_dir(config, data_root)
+        if not fresh:
+            done = find_successful_run(data_root, video, "transcribe")
+            if done is not None:
+                _emit("stage", f"[{index}/{len(videos)}] skip {video.name} — already transcribed as {done.name}")
+                results.append({
+                    "video": video.name,
+                    "status": "skipped",
+                    "run_slug": done.name,
+                    "data_dir": str(done),
+                })
+                continue
+        slug, reused = _prepare_run_folder(
+            config, video,
+            fresh=fresh,
+            required="ocr",
+            matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
+        )
+        _publish_run(config)
+        _emit("stage", f"[{index}/{len(videos)}] transcribe {video.name} → {slug}" + (" (resuming)" if reused else ""))
+        try:
+            result = transcribe_video(str(video), config, config.data_dir)
+            slug = _finish_named_run(config, video, kind="transcribe", generate=generate)
+            results.append({
+                "video": video.name,
+                "status": "done",
+                "run_slug": slug,
+                "data_dir": str(config.data_dir),
+                **{k: v for k, v in result.items() if k != "error"},
+            })
+        except Exception as exc:
+            write_run_identity(config.data_dir, {"status": "error", "error": str(exc)[:400]})
+            _emit("error", f"{video.name}: {exc}")
+            results.append({
+                "video": video.name,
+                "status": "error",
+                "run_slug": Path(config.data_dir).name,
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+
+    return _queue_result("transcribe", videos, results)
+
+
+def _queue_result(
+    pipeline: str,
+    videos: list[Path],
+    results: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One-video jobs keep the old top-level fields the overview line reads."""
+    failed = [r for r in results if r.get("status") == "error"]
+    done = [r for r in results if r.get("status") == "done"]
+    skipped = [r for r in results if r.get("status") == "skipped"]
+    payload: dict[str, Any] = {
+        "videos": len(videos),
+        "processed": len(done),
+        "skipped": len(skipped),
+        "failed": len(failed),
+        "results": results,
+    }
+    if len(results) == 1:
+        payload.update(results[0])
+        payload.pop("status", None)
+    elif done:
+        payload["run_slug"] = done[-1].get("run_slug")
+        payload["data_dir"] = done[-1].get("data_dir")
+    if failed and len(failed) == len(results):
+        payload["error"] = failed[0].get("error")
+    return payload
 
 
 def _run_reconstruct(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
@@ -615,8 +775,11 @@ def search_now(params: dict[str, Any]) -> dict[str, Any]:
 
     config = _build_config(params)
     point_config_at_data_dir(config, folder)
+    identity = read_run_identity(folder) or {}
     config.vector_db.collection_name = str(
-        params.get("collection") or f"screenlens_{_base(folder.name)}"
+        params.get("collection")
+        or identity.get("collection")
+        or f"screenlens_{_base(folder.name)}"
     )
     if params.get("top_k"):
         config.search.top_k = int(params["top_k"])

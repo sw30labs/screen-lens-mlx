@@ -98,6 +98,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json(self._health())
         elif path == "/api/roles":
             self._send_json(runner.roles(self._one(query, "config_file")))
+        elif path == "/api/defaults":
+            self._send_json(runner.defaults(self._one(query, "config_file")))
         elif path == "/api/backend":
             self._send_json(runner.probe_endpoint(self._one(query, "config_file")))
         elif path == "/api/runs":
@@ -130,7 +132,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_frame(path)
         elif path == "/api/videos":
             folder = self._one(query, "folder") or "./input"
-            self._send_json({"folder": folder, "videos": runner.list_videos(folder)})
+            self._send_json({
+                "folder": folder,
+                "videos": runner.list_videos(folder, self._one(query, "data_dir")),
+            })
         elif path == "/api/events":
             self._send_json({
                 "events": runner.live_events(limit=self._int(query, "limit", 120)),

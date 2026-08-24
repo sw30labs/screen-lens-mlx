@@ -37,6 +37,10 @@ class TestConfig:
         monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
         monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
         monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.delenv("SCREENLENS_CAPTION_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("SCREENLENS_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_SAMPLE_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_STRATEGY", raising=False)
         monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
         monkeypatch.setattr(config_module.platform, "system", lambda: "Linux")
         monkeypatch.setattr(config_module.platform, "machine", lambda: "aarch64")
@@ -62,6 +66,10 @@ class TestConfig:
         monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
         monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
         monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.delenv("SCREENLENS_CAPTION_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("SCREENLENS_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_SAMPLE_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_STRATEGY", raising=False)
         monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
         monkeypatch.setattr(config_module.platform, "system", lambda: "Darwin")
         monkeypatch.setattr(config_module.platform, "machine", lambda: "arm64")
@@ -80,11 +88,19 @@ class TestConfig:
         monkeypatch.setenv("SCREENLENS_BACKEND", "ollama")
         monkeypatch.setenv("SCREENLENS_DEVICE", "cpu")
         monkeypatch.setenv("SCREENLENS_BATCH_SIZE", "7")
+        monkeypatch.setenv("SCREENLENS_CAPTION_MAX_TOKENS", "16768")
+        monkeypatch.setenv("SCREENLENS_FPS", "2.5")
+        monkeypatch.setenv("SCREENLENS_SAMPLE_FPS", "3")
+        monkeypatch.setenv("SCREENLENS_STRATEGY", "fixed_fps")
 
         config = ScreenLensConfig()
         assert config.captioning.backend == CaptionBackend.ollama
         assert config.ocr.backend in (InferenceBackend.vllm, InferenceBackend.omlx)
         assert config.captioning.batch_size == 7
+        assert config.captioning.max_tokens == 16768
+        assert config.frame_extraction.fps == 2.5
+        assert config.frame_extraction.strategy.value == "fixed_fps"
+        assert config.frame_selection.sample_fps == 3.0
         assert config.embedding.device == "cpu"
 
     def test_dotenv_applies_platform_default_overrides(self, monkeypatch, tmp_path):
@@ -94,20 +110,59 @@ class TestConfig:
         (tmp_path / ".env").write_text(
             "SCREENLENS_BACKEND=ollama\n"
             "SCREENLENS_DEVICE=cpu\n"
-            "SCREENLENS_BATCH_SIZE=3\n",
+            "SCREENLENS_BATCH_SIZE=3\n"
+            "SCREENLENS_CAPTION_MAX_TOKENS=16768\n"
+            "SCREENLENS_FPS=0.5\n"
+            "SCREENLENS_SAMPLE_FPS=4\n"
+            "SCREENLENS_STRATEGY=fixed_fps\n",
             encoding="utf-8",
         )
         monkeypatch.chdir(tmp_path)
         monkeypatch.delenv("SCREENLENS_BACKEND", raising=False)
         monkeypatch.delenv("SCREENLENS_DEVICE", raising=False)
         monkeypatch.delenv("SCREENLENS_BATCH_SIZE", raising=False)
+        monkeypatch.delenv("SCREENLENS_CAPTION_MAX_TOKENS", raising=False)
+        monkeypatch.delenv("SCREENLENS_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_SAMPLE_FPS", raising=False)
+        monkeypatch.delenv("SCREENLENS_STRATEGY", raising=False)
         monkeypatch.setattr(config_module, "_DOTENV_LOADED", False)
 
         config = ScreenLensConfig()
 
         assert config.captioning.backend == CaptionBackend.ollama
         assert config.captioning.batch_size == 3
+        assert config.captioning.max_tokens == 16768
+        assert config.frame_extraction.fps == 0.5
+        assert config.frame_extraction.strategy.value == "fixed_fps"
+        assert config.frame_selection.sample_fps == 4.0
         assert config.embedding.device == "cpu"
+
+    def test_form_defaults_follow_env(self, monkeypatch):
+        from src.config import ScreenLensConfig
+        from src.session import form_defaults
+
+        monkeypatch.setenv("SCREENLENS_CAPTION_MAX_TOKENS", "16768")
+        monkeypatch.setenv("SCREENLENS_STRATEGY", "keyframe")
+        monkeypatch.setenv("SCREENLENS_FPS", "1.5")
+        monkeypatch.setenv("SCREENLENS_SAMPLE_FPS", "2.5")
+
+        defaults = form_defaults(ScreenLensConfig())
+        assert defaults["caption_max_tokens"] == 16768
+        assert defaults["strategy"] == "keyframe"
+        assert defaults["fps"] == 1.5
+        assert defaults["sample_fps"] == 2.5
+        assert defaults["backend"]
+        assert defaults["base_url"]
+        assert defaults["cleanup"] is False
+        assert defaults["deterministic"] is False
+
+    def test_bad_caption_token_env_falls_back(self, monkeypatch):
+        import src.config as config_module
+        from src.config import ScreenLensConfig
+
+        monkeypatch.setenv("SCREENLENS_CAPTION_MAX_TOKENS", "nope")
+        monkeypatch.setattr(config_module, "_DOTENV_LOADED", True)
+        assert ScreenLensConfig().captioning.max_tokens == 32768
 
     def test_config_override(self):
         from src.config import ScreenLensConfig
@@ -261,6 +316,15 @@ class TestOMLXClient:
         from src.omlx_client import DEFAULT_VLLM_MODEL, is_known_vision_model
 
         assert is_known_vision_model(DEFAULT_VLLM_MODEL)
+
+    def test_qwen38_omlx_id_is_known_multimodal(self):
+        from src.omlx_client import is_known_vision_model, is_known_text_only_model
+
+        # No "VL" in the served id — same trap as Qwen3.6. Without this the
+        # deck lists the live model as text and keeps a stale OMLX_MODEL in
+        # the vision dropdown as "configured — not served".
+        assert is_known_vision_model("Qwen3.8-27B-bf16")
+        assert not is_known_text_only_model("Qwen3.8-27B-bf16")
 
     def test_loopback_requests_bypass_proxy_environment(self, monkeypatch):
         from urllib import request

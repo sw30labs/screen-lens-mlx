@@ -33,12 +33,21 @@ from .config import (
 from .omlx_client import resolve_inference_model, resolve_llm_model, resolve_ocr_model
 from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
 from .session import (
+    DEFAULT_INPUT_FOLDER,
+    apply_content_name,
     apply_video_slug,
+    content_excerpt,
     extraction_meta_matches,
     find_reusable_run,
+    find_successful_run,
+    infer_content_slug,
     load_config,
+    point_config_at_data_dir,
+    resolve_video_queue,
     reuse_video_run,
+    text_slug_generate,
     transcribe_run_matches,
+    write_run_identity,
 )
 
 app = typer.Typer(
@@ -83,6 +92,16 @@ def _prepare_video_run(
     return apply_video_slug(config, video), False
 
 
+def _finish_named_run(config: ScreenLensConfig, video: Path, generate) -> str:
+    excerpt = content_excerpt(config.data_dir)
+    slug_base = infer_content_slug(excerpt, generate=generate)
+    slug = apply_content_name(config, video, slug_base)
+    write_run_identity(config.data_dir, {"status": "success"})
+    if slug_base:
+        console.print(f"[dim]  Named run {slug}[/dim]")
+    return slug
+
+
 def _apply_captioning_options(
     config: ScreenLensConfig,
     *,
@@ -123,7 +142,10 @@ def _caption_model_display(config: ScreenLensConfig) -> str:
 
 @app.command()
 def ingest(
-    video_path: str = typer.Argument(..., help="Path to the video file (.mov, .mp4, etc.)"),
+    video_path: Optional[str] = typer.Argument(
+        None,
+        help="Video file or folder. Omit to process every file in ./input, oldest first.",
+    ),
     # Extraction strategy
     strategy: str = typer.Option("keyframe", help="Extraction strategy: 'keyframe' (smart) or 'fixed_fps'"),
     fps: float = typer.Option(1.0, help="Frames per second (only for fixed_fps strategy)"),
@@ -152,12 +174,18 @@ def ingest(
 ):
     """Ingest a video: extract keyframes, generate captions, create embeddings.
 
-    Re-running the same video resumes the newest prior run instead of paying
-    for extraction, captions, and embeddings again (use --fresh to start over).
+    Omit the path (or pass a folder) to process every video in ./input,
+    oldest recording first. Already-successful ingestions are skipped;
+    --fresh forces a new run. The run folder is renamed from the content
+    after captions exist (screen-recording timestamps are not used as names).
     """
-    video = Path(video_path)
-    if not video.exists():
-        console.print(f"[red]Error: Video file not found: {video_path}[/red]")
+    try:
+        videos = resolve_video_queue(video_path, default_folder=DEFAULT_INPUT_FOLDER)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+    if not videos:
+        console.print(f"[yellow]No video files found in {video_path or DEFAULT_INPUT_FOLDER}[/yellow]")
         raise typer.Exit(1)
 
     config = _load_config(config_file)
@@ -180,39 +208,66 @@ def ingest(
     # Embedding
     config.embedding.device = device
 
-    # Per-video data directory: resume the newest prior run of this video when
-    # its extraction config matches, otherwise mint a fresh slug (as `batch`).
-    slug, reused = _prepare_video_run(
-        config, video, fresh=fresh,
-        required="frames/frames_meta.json",
-        matches=extraction_meta_matches,
-    )
-    if reused:
-        console.print(f"[dim]Resuming run {slug} — completed stages are skipped (--fresh to start over)[/dim]")
-
-    # Display config
     model_display = _caption_model_display(config)
+    data_root = Path(config.data_dir)
+    generate = text_slug_generate(config)
 
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Video Ingestion[/bold green]\n"
-        f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
-        f"Output: {config.data_dir}\n"
+        f"Videos: {len(videos)} (oldest first; successful runs skipped)\n"
         f"Extraction: {strategy} | Captioning: {backend} ({model_display})\n"
         f"CLIP device: {device}",
         title="Configuration",
     ))
 
     pipeline = build_ingest_graph()
-    initial_state = {
-        "video_path": str(video.resolve()),
-        "config": config.model_dump(),
-    }
+    last_result = None
+    last_elapsed = 0.0
+    for index, video in enumerate(videos, 1):
+        point_config_at_data_dir(config, data_root)
+        if not fresh:
+            done = find_successful_run(data_root, video, "ingest")
+            if done is not None:
+                console.print(
+                    f"[dim]({index}/{len(videos)}) skip {video.name} — already ingested as {done.name}[/dim]"
+                )
+                continue
+        slug, reused = _prepare_video_run(
+            config, video, fresh=fresh,
+            required="frames/frames_meta.json",
+            matches=extraction_meta_matches,
+        )
+        if reused:
+            console.print(f"[dim]({index}/{len(videos)}) resuming {slug}[/dim]")
+        else:
+            console.print(f"[cyan]({index}/{len(videos)}) ingest {video.name} → {slug}[/cyan]")
 
-    t0 = time.time()
-    result = pipeline.invoke(initial_state)
-    total_time = time.time() - t0
+        t0 = time.time()
+        try:
+            last_result = pipeline.invoke({
+                "video_path": str(video.resolve()),
+                "config": config.model_dump(),
+            })
+            last_elapsed = time.time() - t0
+            slug = _finish_named_run(config, video, generate)
+            write_run_identity(config.data_dir, {"pipeline": "ingest"})
+            console.print(f"[green]  ✓ {video.name} → {slug} in {last_elapsed:.1f}s[/green]")
+        except Exception as exc:
+            write_run_identity(config.data_dir, {"status": "error", "error": str(exc)[:400]})
+            console.print(f"[red]  ✗ {video.name} — {exc}[/red]")
+            if len(videos) == 1:
+                raise typer.Exit(1)
 
-    # Display results
+    if last_result is None:
+        console.print("[bold green]Nothing to ingest — every file already succeeded.[/bold green]")
+        return
+
+    if len(videos) > 1:
+        console.print(f"\n[bold green]Ingestion complete — {len(videos)} file(s).[/bold green]")
+        return
+
+    result = last_result
+    total_time = last_elapsed
     console.print(f"\n[bold green]Ingestion complete![/bold green]")
 
     table = Table(title="Pipeline Summary")
@@ -578,10 +633,11 @@ def batch(
         console.print(f"[red]Error: Not a directory: {folder_path}[/red]")
         raise typer.Exit(1)
 
-    videos = sorted(
-        p for p in folder.iterdir()
-        if p.is_file() and p.suffix.lower() in VIDEO_EXTENSIONS
-    )
+    try:
+        videos = resolve_video_queue(folder, default_folder=folder)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
 
     if not videos:
         console.print(f"[yellow]No video files found in {folder_path}[/yellow]")
@@ -616,6 +672,14 @@ def batch(
             omlx_api_key=omlx_api_key,
         )
         config.embedding.device = device
+        data_root = Path(config.data_dir)
+        generate = text_slug_generate(config)
+
+        if not fresh:
+            done = find_successful_run(data_root, video, "ingest")
+            if done is not None:
+                console.print(f"[dim]  skip — already ingested as {done.name}[/dim]")
+                continue
 
         # Per-video data directory (resume semantics shared with `ingest`/`run`)
         slug, reused = _prepare_video_run(
@@ -636,10 +700,13 @@ def batch(
         try:
             result = pipeline.invoke(initial_state)
             elapsed = time.time() - t0
+            slug = _finish_named_run(config, video, generate)
+            write_run_identity(config.data_dir, {"pipeline": "ingest"})
             num_frames = result.get("num_frames", 0)
-            console.print(f"[green]  ✓ {video.name} — {num_frames} frames in {elapsed:.1f}s[/green]")
+            console.print(f"[green]  ✓ {video.name} → {slug} — {num_frames} frames in {elapsed:.1f}s[/green]")
         except Exception as e:
             elapsed = time.time() - t0
+            write_run_identity(config.data_dir, {"status": "error", "error": str(e)[:400]})
             console.print(f"[red]  ✗ {video.name} — failed after {elapsed:.1f}s: {e}[/red]")
 
     console.print(f"\n[bold green]Batch complete — processed {len(videos)} videos.[/bold green]")
@@ -857,7 +924,10 @@ def assemble(
 
 @app.command()
 def transcribe(
-    video_path: str = typer.Argument(..., help="Path to the screen recording (.mov, .mp4, ...)"),
+    video_path: Optional[str] = typer.Argument(
+        None,
+        help="Screen recording or folder. Omit to process every file in ./input, oldest first.",
+    ),
     backend: str = typer.Option(DEFAULT_INFERENCE_BACKEND, help="Inference backend: vllm or omlx"),
     ocr_model: Optional[str] = typer.Option(None, help="Vision OCR model id (defaults to the served model)"),
     llm_model: Optional[str] = typer.Option(None, help="Text model for optional seam cleanup"),
@@ -877,15 +947,20 @@ def transcribe(
 ):
     """Verbatim transcription: faithfully reconstruct the text/code shown in a recording.
 
-    Pipeline: scroll-safe frame selection → vision OCR → text-space stitch →
-    LLM seam/indent cleanup. Output is written to ./data/<slug>/output/transcript.md.
+    Omit the path (or pass a folder) to process every video in ./input,
+    oldest first. Already-successful transcripts are skipped. The run folder
+    is renamed from the transcribed content after a successful pass.
     """
     from .transcribe import transcribe_video
     from .omlx_client import normalize_api_base_url
 
-    video = Path(video_path)
-    if not video.exists():
-        console.print(f"[red]Error: Video file not found: {video_path}[/red]")
+    try:
+        videos = resolve_video_queue(video_path, default_folder=DEFAULT_INPUT_FOLDER)
+    except FileNotFoundError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        raise typer.Exit(1)
+    if not videos:
+        console.print(f"[yellow]No video files found in {video_path or DEFAULT_INPUT_FOLDER}[/yellow]")
         raise typer.Exit(1)
 
     config = _load_config(config_file)
@@ -906,37 +981,67 @@ def transcribe(
     config.reconstruction.enabled = cleanup
     config.ocr.deterministic_backstop = deterministic
 
-    slug, reused = _prepare_video_run(
-        config, video, fresh=fresh,
-        required="ocr",
-        matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
-    )
-    if reused:
-        console.print(f"[dim]Resuming run {slug} — cached OCR is reused (--fresh to start over)[/dim]")
-
     from .omlx_client import resolve_ocr_model, resolve_llm_model
+    data_root = Path(config.data_dir)
+    generate = text_slug_generate(config)
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Verbatim Transcription[/bold green]\n"
-        f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
-        f"Output: {config.data_dir}/output/transcript.md\n"
+        f"Videos: {len(videos)} (oldest first; successful runs skipped)\n"
         f"OCR (vision): {resolve_ocr_model(config.ocr)}\n"
         f"Cleanup (text): {resolve_llm_model(config.reconstruction) if cleanup else 'disabled'}\n"
         f"Sample: {sample_fps} fps | Deterministic backstop: {deterministic}",
         title="Configuration",
     ))
 
-    t0 = time.time()
-    try:
-        result = transcribe_video(str(video.resolve()), config, config.data_dir)
-    except RuntimeError as exc:
-        console.print(f"\n[red]Transcription aborted:[/red] {exc}")
-        raise typer.Exit(1)
-    elapsed = time.time() - t0
+    last_result = None
+    last_elapsed = 0.0
+    for index, video in enumerate(videos, 1):
+        point_config_at_data_dir(config, data_root)
+        if not fresh:
+            done = find_successful_run(data_root, video, "transcribe")
+            if done is not None:
+                console.print(
+                    f"[dim]({index}/{len(videos)}) skip {video.name} — already transcribed as {done.name}[/dim]"
+                )
+                continue
+        slug, reused = _prepare_video_run(
+            config, video, fresh=fresh,
+            required="ocr",
+            matches=lambda run_dir, vid, _cfg: transcribe_run_matches(run_dir, vid),
+        )
+        if reused:
+            console.print(f"[dim]({index}/{len(videos)}) resuming {slug}[/dim]")
+        else:
+            console.print(f"[cyan]({index}/{len(videos)}) transcribe {video.name} → {slug}[/cyan]")
+        t0 = time.time()
+        try:
+            last_result = transcribe_video(str(video.resolve()), config, config.data_dir)
+            last_elapsed = time.time() - t0
+        except RuntimeError as exc:
+            write_run_identity(config.data_dir, {"status": "error", "error": str(exc)[:400]})
+            console.print(f"[red]  ✗ {video.name} — {exc}[/red]")
+            if len(videos) == 1:
+                raise typer.Exit(1)
+            continue
+        if last_result.get("error"):
+            write_run_identity(config.data_dir, {"status": "error", "error": last_result["error"]})
+            console.print(f"[red]  ✗ {video.name} — {last_result['error']}[/red]")
+            if len(videos) == 1:
+                raise typer.Exit(1)
+            continue
+        slug = _finish_named_run(config, video, generate)
+        write_run_identity(config.data_dir, {"pipeline": "transcribe"})
+        console.print(f"[green]  ✓ {video.name} → {slug} in {last_elapsed:.1f}s[/green]")
 
-    if result.get("error"):
-        console.print(f"[red]Error: {result['error']}[/red]")
-        raise typer.Exit(1)
+    if last_result is None:
+        console.print("[bold green]Nothing to transcribe — every file already succeeded.[/bold green]")
+        return
+    if len(videos) > 1:
+        console.print(f"\n[bold green]Transcription complete — {len(videos)} file(s).[/bold green]")
+        return
 
+    result = last_result
+    elapsed = last_elapsed
     console.print(f"\n[bold green]Done in {elapsed:.1f}s[/bold green]")
     table = Table(title="Transcription Summary")
     table.add_column("Metric", style="cyan")

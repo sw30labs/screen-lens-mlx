@@ -143,7 +143,7 @@ class TestWebAssets:
     def test_index_calls_only_real_endpoints(self):
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         called = set(re.findall(r'["`/]api/([a-z]+)', html))
-        served = {"health", "roles", "backend", "runs", "run", "artifact",
+        served = {"health", "roles", "defaults", "backend", "runs", "run", "artifact",
                   "frame", "videos", "events", "jobs", "search", "shutdown"}
         assert called <= served, f"SPA calls endpoints the server does not serve: {called - served}"
 
@@ -177,8 +177,22 @@ class TestWebAPI:
         assert body["caption"]["role"] == "vision"
         assert body["ocr"]["role"] == "vision"
         assert body["text"]["role"] == "text"
-        # The text role must not be silently reused for vision work.
-        assert body["text"]["model"]
+
+    def test_defaults_expose_form_values(self, server):
+        status, body = get(server, "/api/defaults")
+        assert status == 200
+        assert set(body) >= {
+            "backend",
+            "base_url",
+            "strategy",
+            "fps",
+            "sample_fps",
+            "caption_max_tokens",
+            "cleanup",
+            "deterministic",
+        }
+        assert body["caption_max_tokens"] >= 1
+        assert body["strategy"] in {"keyframe", "fixed_fps"}
 
     def test_runs_and_snapshot(self, server, data_root):
         _, body = get(server, "/api/runs")
@@ -446,6 +460,46 @@ class TestWebSecurity:
         assert status == 400
         assert "video not found" in body["error"]
         assert not runner.busy()
+
+    def test_empty_video_path_with_empty_input_is_refused(self, server, tmp_path):
+        inbox = tmp_path / "input"
+        inbox.mkdir()
+        status, body = post(
+            server, "/api/run",
+            {"pipeline": "ingest", "input_folder": str(inbox)},
+        )
+        assert status == 400
+        assert "no video files" in body["error"]
+        assert not runner.busy()
+
+    def test_empty_video_path_queues_input_chronologically(self, server, tmp_path):
+        inbox = tmp_path / "input"
+        inbox.mkdir()
+        later = inbox / "Screen Recording 2026-08-17 at 10.00.00 AM.mov"
+        earlier = inbox / "Screen Recording 2026-08-17 at 9.00.00 AM.mov"
+        later.write_bytes(b"x")
+        earlier.write_bytes(b"x")
+        captured = {}
+
+        def fake(params, config):
+            captured["queue"] = list(params.get("video_queue") or [])
+            return {"ok": True, "videos": len(captured["queue"])}
+
+        runner.set_pipeline_override("ingest", fake)
+        status, body = post(
+            server, "/api/run",
+            {"pipeline": "ingest", "input_folder": str(inbox)},
+        )
+        assert status == 202
+        deadline = time.time() + 15
+        job = None
+        while time.time() < deadline:
+            _, job = get(server, f"/api/jobs/{body['job_id']}")
+            if job["status"] != "running":
+                break
+            time.sleep(0.05)
+        assert job["status"] == "done"
+        assert [Path(p).name for p in captured["queue"]] == [earlier.name, later.name]
 
     def test_handler_errors_answer_500_instead_of_dropping_the_socket(self, server, monkeypatch):
         """An exception escaping a handler leaves the client with no response

@@ -58,14 +58,72 @@ class ExtractionStrategy(str, Enum):
     keyframe = "keyframe"         # Smart: hybrid change detection (SSIM + pHash + HSV)
 
 
+def _env_text(name: str) -> str:
+    load_dotenv_if_present()
+    return os.getenv(name, "").strip()
+
+
+def _env_int(name: str, fallback: int, *, minimum: int | None = None) -> int:
+    raw = _env_text(name)
+    if not raw:
+        return fallback
+    try:
+        value = int(raw)
+    except ValueError:
+        return fallback
+    if minimum is not None and value < minimum:
+        return fallback
+    return value
+
+
+def _env_float(name: str, fallback: float, *, minimum: float | None = None) -> float:
+    raw = _env_text(name)
+    if not raw:
+        return fallback
+    try:
+        value = float(raw)
+    except ValueError:
+        return fallback
+    if minimum is not None and value < minimum:
+        return fallback
+    return value
+
+
+def default_caption_max_tokens() -> int:
+    """Caption output budget. ``SCREENLENS_CAPTION_MAX_TOKENS`` overrides."""
+    return _env_int("SCREENLENS_CAPTION_MAX_TOKENS", 32768, minimum=1)
+
+
+def default_extract_fps() -> float:
+    """Fixed-FPS extraction rate. ``SCREENLENS_FPS`` overrides."""
+    return _env_float("SCREENLENS_FPS", 1.0, minimum=0.0)
+
+
+def default_sample_fps() -> float:
+    """Transcribe sample rate. ``SCREENLENS_SAMPLE_FPS`` overrides."""
+    return _env_float("SCREENLENS_SAMPLE_FPS", 2.0, minimum=0.0)
+
+
+def default_extract_strategy() -> ExtractionStrategy:
+    """Frame extraction strategy. ``SCREENLENS_STRATEGY`` overrides."""
+    raw = _env_text("SCREENLENS_STRATEGY").lower()
+    try:
+        return ExtractionStrategy(raw) if raw else ExtractionStrategy.keyframe
+    except ValueError:
+        return ExtractionStrategy.keyframe
+
+
 class FrameExtractionConfig(BaseModel):
     """Settings for video frame extraction."""
     strategy: ExtractionStrategy = Field(
-        default=ExtractionStrategy.keyframe,
+        default_factory=default_extract_strategy,
         description="Extraction strategy: 'keyframe' (smart, recommended) or 'fixed_fps'"
     )
     # Fixed FPS settings
-    fps: float = Field(default=1.0, description="Frames per second (only for fixed_fps strategy)")
+    fps: float = Field(
+        default_factory=default_extract_fps,
+        description="Frames per second (only for fixed_fps strategy)",
+    )
     # Keyframe detection settings (hybrid change detector)
     ssim_threshold: float = Field(default=0.97, description="SSIM below this = scene change")
     phash_threshold: int = Field(default=8, description="Perceptual hash hamming distance threshold")
@@ -201,11 +259,12 @@ class CaptioningConfig(BaseModel):
     # Shared generation settings
     temperature: float = Field(default=0.1, description="LLM temperature for captions")
     max_tokens: int = Field(
-        default=32768,
+        default_factory=default_caption_max_tokens,
         description=(
-            "Requested output-token ceiling per caption. When this reaches the "
-            "served vLLM context size, ScreenLens lets vLLM use all context "
-            "remaining after the prompt and image."
+            "Requested output-token ceiling per caption. Override with "
+            "SCREENLENS_CAPTION_MAX_TOKENS. When this reaches the served vLLM "
+            "context size, ScreenLens lets vLLM use all context remaining after "
+            "the prompt and image."
         ),
     )
     retry_attempts: int = Field(
@@ -377,7 +436,7 @@ class OCRConfig(BaseModel):
 class FrameSelectionConfig(BaseModel):
     """Settings for selecting frames to OCR (scroll-safe)."""
     sample_fps: float = Field(
-        default=2.0,
+        default_factory=default_sample_fps,
         description="Sample this many frames/sec before dedup (code/docs scroll fast; 2 is safe)",
     )
     drop_duplicate_ssim: float = Field(

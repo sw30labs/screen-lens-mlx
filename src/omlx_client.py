@@ -75,7 +75,7 @@ _KNOWN_VISION_MARKERS = ("vl", "vision", "omni", "janus")
 # normalized id (non-alphanumerics → '-'). VL/vision markers above still win.
 _KNOWN_VISION_PATTERNS = (
     "gemma-4", "gemma-3",          # Gemma 3/4 are natively multimodal (OCR/doc/screen)
-    "qwen3-6", "qwen3-5",          # Qwen3.5/3.6 are unified multimodal
+    "qwen3-8", "qwen3-6", "qwen3-5",  # Qwen3.5/3.6/3.8 are unified multimodal
     "qwen2-5-vl", "qwen3-vl",
     "pixtral", "internvl", "minicpm-v", "llava", "molmo", "kimi-vl",
 )

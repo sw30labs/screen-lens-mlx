@@ -519,7 +519,7 @@ pre.doc {
           <div>
             <label class="rf-label">Backend</label>
             <select class="input" id="f-backend">
-              <option value="omlx" selected>omlx</option>
+              <option value="omlx">omlx</option>
               <option value="vllm">vllm</option>
               <option value="ollama">ollama (captions only)</option>
             </select>
@@ -527,8 +527,10 @@ pre.doc {
           <div class="full" data-need="video">
             <label class="rf-label">Video</label>
             <select class="input" id="f-video-pick" style="margin-bottom:8px"></select>
-            <input class="input" id="f-video" placeholder="/path/to/recording.mov" />
-            <div class="hint">Picker lists ./input — type any path to use a file elsewhere.</div>
+            <input class="input" id="f-video" placeholder="leave empty = all of ./input" />
+            <div class="hint">Empty processes every file in ./input, oldest first, and skips
+              already-successful runs. Type a path to do one file. Run folders are named
+              from the content after a successful pass — not from the screen-recording timestamp.</div>
           </div>
           <div data-need="run">
             <label class="rf-label">Run folder</label>
@@ -537,26 +539,26 @@ pre.doc {
           <div data-need="ingest">
             <label class="rf-label">Extraction strategy</label>
             <select class="input" id="f-strategy">
-              <option value="keyframe" selected>keyframe (hybrid change detection)</option>
+              <option value="keyframe">keyframe (hybrid change detection)</option>
               <option value="fixed_fps">fixed_fps</option>
             </select>
           </div>
           <div data-need="ingest">
             <label class="rf-label">FPS (fixed_fps only)</label>
-            <input class="input" id="f-fps" type="number" step="0.1" value="1.0" />
+            <input class="input" id="f-fps" type="number" step="0.1" />
           </div>
           <div data-need="transcribe">
             <label class="rf-label">Sample FPS</label>
-            <input class="input" id="f-samplefps" type="number" step="0.5" value="2.0" />
+            <input class="input" id="f-samplefps" type="number" step="0.5" />
           </div>
           <div data-need="ingest">
             <label class="rf-label">Caption token budget</label>
-            <input class="input" id="f-captiontokens" type="number" step="128" min="128" value="1500" />
-            <div class="hint">Max output tokens per caption. Watch Live Activity: a
-              "truncated the response at N (finish_reason=length)" warning means captions are being
-              cut off — raise this. Leave empty for the config default (the full context), but on a
-              dense frame that lets the model run past the real content into a repetition loop,
-              costing tens of minutes per frame.</div>
+            <input class="input" id="f-captiontokens" type="number" step="128" min="128" />
+            <div class="hint">Max output tokens per caption, from
+              <code>SCREENLENS_CAPTION_MAX_TOKENS</code> in <code>.env</code>.
+              Watch Live Activity: a "truncated the response at N (finish_reason=length)"
+              warning means captions are being cut off — raise this. An unbounded
+              budget on a dense frame can loop for tens of minutes.</div>
           </div>
           <div>
             <label class="rf-label">Vision model (captions / OCR)</label>
@@ -787,6 +789,21 @@ async function api(path, opts) {
 }
 function post(path, body) {
   return api(path, {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+}
+
+/* ── form defaults from config / .env ── */
+async function applyFormDefaults() {
+  try {
+    const d = await api("/api/defaults");
+    if (d.backend) $("#f-backend").value = d.backend;
+    if (d.base_url && !$("#f-baseurl").value) $("#f-baseurl").value = d.base_url;
+    if (d.strategy) $("#f-strategy").value = d.strategy;
+    if (d.fps != null) $("#f-fps").value = d.fps;
+    if (d.sample_fps != null) $("#f-samplefps").value = d.sample_fps;
+    if (d.caption_max_tokens != null) $("#f-captiontokens").value = d.caption_max_tokens;
+    $("#f-cleanup").checked = !!d.cleanup;
+    $("#f-deterministic").checked = !!d.deterministic;
+  } catch (e) { /* leave the form empty rather than invent numbers */ }
 }
 
 /* ── models + roles ── */
@@ -1060,8 +1077,13 @@ function renderJobs(jobs) {
 
 function summarizeResult(job) {
   const r = job.result || {};
-  if (job.pipeline === "ingest") return `${r.num_frames ?? "?"} frames → ${r.run_slug ?? ""}`;
-  if (job.pipeline === "transcribe") return `${r.frames_with_text ?? "?"}/${r.frames_selected ?? "?"} frames with text`;
+  if (job.pipeline === "ingest" || job.pipeline === "transcribe") {
+    if (r.videos > 1) {
+      return `${r.processed || 0} done, ${r.skipped || 0} skipped, ${r.failed || 0} failed of ${r.videos}`;
+    }
+    if (job.pipeline === "ingest") return `${r.num_frames ?? "?"} frames → ${r.run_slug ?? ""}`;
+    return `${r.frames_with_text ?? "?"}/${r.frames_selected ?? "?"} frames with text`;
+  }
   if (job.pipeline === "summarize") return `${r.chars ?? 0} char summary`;
   if (job.pipeline === "reconstruct") return `${r.folders ?? 0} folder(s)`;
   return JSON.stringify(r).slice(0, 120);
@@ -1080,11 +1102,14 @@ async function loadVideos() {
   try {
     const d = await api("/api/videos?folder=./input");
     const sel = $("#f-video-pick");
-    sel.innerHTML = `<option value="">— pick from ./input —</option>` +
-      (d.videos || []).map(v => `<option value="${esc(v.path)}">${esc(v.name)} (${fmtBytes(v.size)})</option>`).join("");
+    sel.innerHTML = `<option value="">— all files in ./input (chronological, skip done) —</option>` +
+      (d.videos || []).map(v => {
+        const marks = [v.ingest_done ? "ingest✓" : "", v.transcribe_done ? "ocr✓" : ""].filter(Boolean).join(" ");
+        return `<option value="${esc(v.path)}">${esc(v.name)} (${fmtBytes(v.size)})${marks ? " · " + marks : ""}</option>`;
+      }).join("");
   } catch (e) { /* folder may not exist */ }
 }
-$("#f-video-pick").addEventListener("change", e => { if (e.target.value) $("#f-video").value = e.target.value; });
+$("#f-video-pick").addEventListener("change", e => { $("#f-video").value = e.target.value; });
 
 async function startRun() {
   const pipeline = $("#f-pipeline").value;
@@ -1098,7 +1123,6 @@ async function startRun() {
   const needs = NEEDS[pipeline] || {};
   if (needs.video) {
     body.video_path = $("#f-video").value.trim();
-    if (!body.video_path) { alert("A video path is required for " + pipeline); return; }
   }
   if (needs.run) {
     body.run_slug = $("#f-run").value;
@@ -1235,6 +1259,7 @@ $("#f-baseurl").addEventListener("change", loadBackend);
     const n = location.hash.slice(1);
     if ($(`[data-view="${n}"]`)) go(n);
   }
+  await applyFormDefaults();
   await Promise.all([loadRuns(), loadVideos(), loadBackend()]);
   renderKPIs();
   await poll();
