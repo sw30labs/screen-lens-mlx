@@ -270,3 +270,15 @@ The existing oMLX/MPS settings, CLI flags, and environment aliases remain the
 native macOS path. None of the DGX commands run automatically, and `.venv-dgx`
 is separate from Apple development environments. Use the ordinary README and
 oMLX settings on Apple Silicon; use this helper only on Linux/ARM64 DGX Spark.
+
+
+### Command deck: Spark and oMLX
+
+Run `screenlens serve` to open the Nightshift-style command deck. Choose
+**Spark cluster · vLLM** for `http://192.168.86.44:8000/v1`, or
+**oMLX · Apple Silicon** for `http://127.0.0.1:8000/v1`. These presets match
+Nightshift; the endpoint field remains editable for other cluster addresses.
+Endpoint checks and model lists follow the selected backend and URL, and jobs
+use those same form values. Select a served vision model for captions/OCR and
+a served text model for reconstruction. The deck supports only these two
+inference backends; existing CLI compatibility is retained.

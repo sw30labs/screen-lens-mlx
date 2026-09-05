@@ -242,6 +242,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid Content-Length"}, status=400)
             return None
         if length > MAX_REQUEST_BYTES:
+            # Drain small overflows so closing the socket does not reset a
+            # client still sending its body before it can read the 413.
+            self.close_connection = True
+            if length <= MAX_REQUEST_BYTES * 2:
+                self.connection.settimeout(2.0)
+                with contextlib.suppress(OSError):
+                    self.rfile.read(length)
             self._send_json({"error": "request body is too large"}, status=413)
             return None
 

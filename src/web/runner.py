@@ -310,7 +310,12 @@ def _build_config(params: dict[str, Any]) -> ScreenLensConfig:
     """Apply dashboard form values onto a freshly loaded config."""
     config = load_config(params.get("config_file") or None)
 
-    backend = str(params.get("backend") or config.captioning.backend.value)
+    from ..config import default_inference_backend
+
+    configured = config.captioning.backend.value
+    if configured not in ("omlx", "vllm"):
+        configured = default_inference_backend().value
+    backend = str(params.get("backend") or configured)
     if backend not in ("omlx", "vllm"):
         raise ValueError("Choose Spark cluster (vllm) or oMLX for inference")
     apply_direct_inference(
