@@ -1,6 +1,6 @@
 """Web command deck server for ScreenLens.
 
-Stdlib-only HTTP server (no new dependencies). Serves the single-file SPA plus
+Stdlib-only HTTP server (no new dependencies). Serves the static dashboard plus
 a JSON API for run state and pipeline control. Binds loopback-only and rejects
 non-loopback clients on every ``/api/`` route — this is a single-operator local
 dashboard that can start jobs and read frames off disk, so it is never exposed
@@ -87,6 +87,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         if path in ("/", "/index.html"):
             self._send_file(STATIC_DIR / "index.html", "text/html; charset=utf-8")
+        elif path in ("/deck.css", "/deck.js"):
+            content_type = "text/css" if path.endswith(".css") else "text/javascript"
+            self._send_file(STATIC_DIR / path[1:], content_type + "; charset=utf-8")
         elif path == "/favicon.svg":
             self._send_file(STATIC_DIR / "favicon.svg", "image/svg+xml")
         elif path == "/api/health":

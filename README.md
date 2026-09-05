@@ -323,24 +323,33 @@ docs/
 setup_and_run_dgx.sh   # Checked Spark setup, validation, and launcher
 setup_and_run_macos.sh # Apple Silicon Conda/oMLX launcher
 src/
-  config.py            # Platform-aware Pydantic configuration
-  frame_extractor.py   # Hybrid keyframe detection + fixed-FPS fallback
-  captioner.py         # vLLM, oMLX, and optional Ollama captioning
-  embedder.py          # OpenCLIP embeddings on CUDA/MPS/CPU
-  vector_store.py      # ChromaDB storage and search
-  pipeline.py          # LangGraph ingest/search/summarize graphs
-  reconstruct.py       # Artifact reconstruction with QA reflection
-  frame_select.py      # Scroll-safe dense sampling for transcription
-  ocr.py               # Verbatim vision OCR and capability probe
-  stitch.py            # Text-space scroll-overlap stitching
-  transcribe.py        # Verbatim pipeline and guarded cleanup
-  omlx_client.py       # Shared inference client; legacy module name retained
-  session.py           # Shared config/slug/run-discovery layer for both front ends
-  cli.py               # Typer CLI
-  web/                 # Web command deck (stdlib HTTP, no build step)
-    server.py          # Loopback-only JSON API + static page
-    runner.py          # One-job-at-a-time background runner
-    static/index.html  # Single-file SPA
+  cli.py               # Stable Typer command entry point
+  config.py            # Shared platform-aware Pydantic settings
+  session.py           # Config loading, model roles, and run discovery
+  inference/
+    client.py          # Provider-neutral Spark/oMLX client
+    captioner.py       # Frame captioning
+    ocr.py             # Verbatim vision OCR
+  video/
+    frame_extractor.py # Keyframe extraction
+    frame_select.py    # Dense sampling for transcription
+    stitch.py          # Scroll-overlap text stitching
+  storage/
+    embedder.py        # OpenCLIP embeddings
+    vector_store.py    # ChromaDB storage and search
+  workflows/
+    pipeline.py        # Ingest/search/summarize graphs
+    transcribe.py      # OCR and guarded cleanup
+    reconstruct.py     # Artifact reconstruction and QA
+    assemble.py        # Corpus assembly
+  web/
+    server.py          # Loopback HTTP API and static assets
+    runner.py          # Background job coordination
+    static/
+      index.html       # Dashboard markup
+      deck.css         # Nightshift-style presentation
+      deck.js          # Dashboard interactions and API calls
+      favicon.svg
 tests/
   test_pipeline.py     # Core configuration, inference, embedding, and graph tests
   test_transcribe.py   # Stitching, OCR guards, and cleanup safety
@@ -409,3 +418,13 @@ Endpoint checks and model lists follow the selected backend and URL, and jobs
 use those same form values. Select a served vision model for captions/OCR and
 a served text model for reconstruction. The deck supports only these two
 inference backends; existing CLI compatibility is retained.
+
+### Package boundaries
+
+Shared configuration and session helpers stay at the package root. Inference
+handles model requests, video handles frames and stitching, storage handles
+embeddings and retrieval, and workflows coordinate those components. The CLI
+and web runner call workflows. Internal imports now use these explicit package
+paths; `screenlens`, `python -m src.cli`, and `python -m src.web` are unchanged.
+Design history lives in `docs/REDESIGN.md`. Local data, environment backups,
+agent state, and tool caches stay ignored and are not moved by this refactor.

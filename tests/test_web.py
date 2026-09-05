@@ -112,7 +112,7 @@ class TestWebAssets:
         assert (STATIC_DIR / "index.html").is_file()
         assert (STATIC_DIR / "favicon.svg").is_file()
 
-    def test_index_is_self_contained(self):
+    def test_index_uses_only_local_assets(self):
         html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
         # No framework, no build step, no CDN — ADR-008 in contingency-atlas.
         assert "<script" in html
@@ -120,10 +120,11 @@ class TestWebAssets:
         assert not re.search(r'<link[^>]+href=["\']https?://', html)
 
     def test_index_calls_only_real_endpoints(self):
-        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        html = (STATIC_DIR / "deck.js").read_text(encoding="utf-8")
         called = set(re.findall(r'["`/]api/([a-z]+)', html))
         served = {"health", "roles", "backend", "runs", "run", "artifact",
                   "frame", "videos", "events", "jobs", "search"}
+        assert called
         assert called <= served, f"SPA calls endpoints the server does not serve: {called - served}"
 
     def test_index_serves_over_http(self, server):
@@ -438,3 +439,11 @@ def test_probe_uses_selected_endpoint(monkeypatch):
 def test_dashboard_requires_spark_or_omlx():
     with pytest.raises(ValueError, match="Spark cluster"):
         runner._build_config({"backend": "ollama"})
+
+
+@pytest.mark.parametrize("asset, mime", [("deck.css", "text/css"), ("deck.js", "text/javascript")])
+def test_dashboard_assets_serve(server, asset, mime):
+    with urllib.request.urlopen(server + "/" + asset, timeout=10) as response:
+        assert response.status == 200
+        assert response.headers["Content-Type"].startswith(mime)
+        assert response.read() == (STATIC_DIR / asset).read_bytes()
