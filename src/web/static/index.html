@@ -519,9 +519,8 @@ pre.doc {
           <div>
             <label class="rf-label">Backend</label>
             <select class="input" id="f-backend">
-              <option value="omlx" selected>omlx</option>
-              <option value="vllm">vllm</option>
-              <option value="ollama">ollama (captions only)</option>
+              <option value="omlx" selected>oMLX · Apple Silicon</option>
+              <option value="vllm">Spark cluster · vLLM</option>
             </select>
           </div>
           <div class="full" data-need="video">
@@ -790,9 +789,12 @@ function post(path, body) {
 }
 
 /* ── models + roles ── */
+function endpointQuery() {
+  return "?" + new URLSearchParams({backend: $("#f-backend").value, base_url: $("#f-baseurl").value});
+}
 async function loadRoles() {
   try {
-    const roles = await api("/api/roles");
+    const roles = await api("/api/roles" + endpointQuery());
     const v = roles.caption || {}, t = roles.text || {};
     const vb = $("#badge-vision");
     vb.textContent = "◉ " + (v.model || "—");
@@ -808,13 +810,15 @@ async function loadRoles() {
 
 async function loadBackend() {
   try {
-    const d = await api("/api/backend");
+    const d = await api("/api/backend" + endpointQuery());
     const el = $("#backend-status");
     if (d.reachable) {
       MODELS = {all: d.models || [], vision: d.vision_models || [], text: d.text_models || []};
       el.innerHTML = `<span style="color:var(--green)">●</span> ${esc(d.provider)} reachable at ${esc(d.base_url)} — ${MODELS.all.length} model(s)`;
       fillModelSelects();
     } else {
+      MODELS = {all: [], vision: [], text: []};
+      $("#f-vision").innerHTML = ""; $("#f-text").innerHTML = "";
       el.innerHTML = `<span style="color:var(--amber)">●</span> ${esc(d.provider)} offline at ${esc(d.base_url)}${d.detail ? " — " + esc(d.detail) : ""}`;
     }
   } catch (e) {
@@ -1223,7 +1227,11 @@ $("#run-search").addEventListener("input", e => renderRunTable(e.target.value));
 $("#refresh-runs").addEventListener("click", () => loadRuns());
 $("#frames-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED));
 $("#art-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED));
-$("#f-backend").addEventListener("change", loadBackend);
+$("#f-backend").addEventListener("change", () => {
+  $("#f-baseurl").value = $("#f-backend").value === "vllm"
+    ? "http://192.168.86.44:8000/v1" : "http://127.0.0.1:8000/v1";
+  loadBackend();
+});
 $("#f-baseurl").addEventListener("change", loadBackend);
 
 (async function init() {

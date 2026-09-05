@@ -92,9 +92,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
         elif path == "/api/health":
             self._send_json(self._health())
         elif path == "/api/roles":
-            self._send_json(runner.roles(self._one(query, "config_file")))
+            self._send_json(runner.roles(self._one(query, "config_file"), **{k: self._one(query, k) for k in ("backend", "base_url")}))
         elif path == "/api/backend":
-            self._send_json(runner.probe_endpoint(self._one(query, "config_file")))
+            self._send_json(runner.probe_endpoint(self._one(query, "config_file"), **{k: self._one(query, k) for k in ("backend", "base_url")}))
         elif path == "/api/runs":
             self._send_json({
                 "runs": runner.list_runs(self._one(query, "data_dir")),

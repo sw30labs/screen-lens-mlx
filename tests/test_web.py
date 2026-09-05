@@ -423,3 +423,18 @@ class TestWebSecurity:
                 urllib.request.urlopen(server + path, timeout=10)
             assert exc.value.code == 404, path
         assert post(server, "/api/nope", {})[0] == 404
+
+
+def test_probe_uses_selected_endpoint(monkeypatch):
+    from src.omlx_client import resolve_inference_base_url
+    monkeypatch.setattr(runner, "endpoint_status", lambda config: {
+        "url": resolve_inference_base_url(config.captioning),
+        "backend": config.captioning.backend.value,
+    })
+    result = runner.probe_endpoint(backend="vllm", base_url="http://spark:8000/v1")
+    assert result == {"url": "http://spark:8000/v1", "backend": "vllm"}
+
+
+def test_dashboard_requires_spark_or_omlx():
+    with pytest.raises(ValueError, match="Spark cluster"):
+        runner._build_config({"backend": "ollama"})

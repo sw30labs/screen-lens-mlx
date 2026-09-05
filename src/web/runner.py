@@ -136,14 +136,14 @@ def live_events(limit: int = 120) -> list[dict[str, Any]]:
     return events[-limit:]
 
 
-def probe_endpoint(config_path: str | None = None) -> dict[str, Any]:
+def probe_endpoint(config_path: str | None = None, **params: Any) -> dict[str, Any]:
     """Reachability + served models for the configured endpoint."""
-    return endpoint_status(load_config(config_path))
+    return endpoint_status(_build_config({"config_file": config_path, **params}))
 
 
-def roles(config_path: str | None = None) -> dict[str, Any]:
+def roles(config_path: str | None = None, **params: Any) -> dict[str, Any]:
     """Resolved vision/text model roles."""
-    return model_roles(load_config(config_path))
+    return model_roles(_build_config({"config_file": config_path, **params}))
 
 
 def list_runs(data_dir: str | None = None) -> list[dict[str, Any]]:
@@ -311,6 +311,8 @@ def _build_config(params: dict[str, Any]) -> ScreenLensConfig:
     config = load_config(params.get("config_file") or None)
 
     backend = str(params.get("backend") or config.captioning.backend.value)
+    if backend not in ("omlx", "vllm"):
+        raise ValueError("Choose Spark cluster (vllm) or oMLX for inference")
     apply_direct_inference(
         config,
         backend=backend,
