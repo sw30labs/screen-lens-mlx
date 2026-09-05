@@ -635,7 +635,7 @@ cmd_smoke() {
       "${image_path}" "${VLLM_BASE_URL}" "${VLLM_MODEL}" "${VLLM_API_KEY}" <<'PY'
 import sys
 
-from src.omlx_client import InferenceClient
+from src.inference.client import InferenceClient
 
 image_path, base_url, model, api_key = sys.argv[1:]
 client = InferenceClient.from_endpoint(

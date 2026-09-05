@@ -43,14 +43,14 @@ OCR flicker, dropped lines, and static-pause duplicate frames (see
 ## What changed in the code
 
 New modules:
-- `src/frame_select.py` — scroll-safe frame selection (dense sample + drop near-exact dupes).
-- `src/ocr.py` — `VerbatimOCR`: vision OCR with a hard capability guard + live probe, anti-loop sampler controls, and an optional Apple Vision (ocrmac) deterministic backstop for code.
-- `src/stitch.py` — text-space stitcher (the core engine).
-- `src/transcribe.py` — orchestrator + constrained LLM cleanup.
+- `src/video/frame_select.py` — scroll-safe frame selection (dense sample + drop near-exact dupes).
+- `src/inference/ocr.py` — `VerbatimOCR`: vision OCR with a hard capability guard + live probe, anti-loop sampler controls, and an optional Apple Vision (ocrmac) deterministic backstop for code.
+- `src/video/stitch.py` — text-space stitcher (the core engine).
+- `src/workflows/transcribe.py` — orchestrator + constrained LLM cleanup.
 
 Changed:
 - `src/config.py` — added `OCRConfig`, `FrameSelectionConfig`, `ReconstructionConfig`; verbatim OCR prompts.
-- `src/omlx_client.py` — generic `from_endpoint` constructor, `list_models()`, real capability checks, sampler-param passthrough; added MiniMax/Kimi to the known-text-only guard list (VL variants still detected as vision).
+- `src/inference/client.py` — generic `from_endpoint` constructor, `list_models()`, real capability checks, sampler-param passthrough; added MiniMax/Kimi to the known-text-only guard list (VL variants still detected as vision).
 - `src/cli.py` — new `transcribe` and `models` commands.
 - `.env` / `.env.example` — split `OCR_MODEL` (vision) from `MLX_MODEL`/`LLM_MODEL` (text).
 

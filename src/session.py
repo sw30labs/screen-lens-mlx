@@ -26,13 +26,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
-from .config import (
+from src.config import (
     CaptioningConfig,
     CaptionBackend,
     InferenceBackend,
     ScreenLensConfig,
 )
-from .omlx_client import (
+from src.inference.client import (
     is_known_text_only_model,
     is_known_vision_model,
     list_models,

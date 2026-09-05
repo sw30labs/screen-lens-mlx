@@ -3,7 +3,7 @@ from collections import defaultdict
 
 
 def test_concurrent_batch_preserves_peer_and_retries_only_failed_frame(monkeypatch):
-    from src.captioner import OpenAICompatibleCaptioner
+    from src.inference.captioner import OpenAICompatibleCaptioner
     from src.config import CaptionBackend, CaptioningConfig
 
     captioner = OpenAICompatibleCaptioner(
@@ -41,7 +41,7 @@ def test_concurrent_batch_preserves_peer_and_retries_only_failed_frame(monkeypat
 
 
 def test_concurrent_batch_marks_only_frame_that_exhausts_retries(monkeypatch):
-    from src.captioner import OpenAICompatibleCaptioner
+    from src.inference.captioner import OpenAICompatibleCaptioner
     from src.config import CaptionBackend, CaptioningConfig
 
     captioner = OpenAICompatibleCaptioner(
@@ -83,7 +83,7 @@ def test_concurrent_batch_marks_only_frame_that_exhausts_retries(monkeypatch):
 
 
 def test_retry_ceiling_never_exceeds_normal_caption_ceiling(monkeypatch):
-    from src.captioner import OpenAICompatibleCaptioner
+    from src.inference.captioner import OpenAICompatibleCaptioner
     from src.config import CaptionBackend, CaptioningConfig
 
     captioner = OpenAICompatibleCaptioner(
@@ -117,7 +117,7 @@ def test_retry_ceiling_never_exceeds_normal_caption_ceiling(monkeypatch):
 def test_caption_frames_reuses_cached_captions(tmp_path, monkeypatch):
     """Per-frame caption files let an interrupted run resume cheaply."""
     import json
-    import src.captioner as cap
+    import src.inference.captioner as cap
     from src.config import CaptionBackend, CaptioningConfig
 
     frames = [
@@ -151,7 +151,7 @@ def test_caption_frames_reuses_cached_captions(tmp_path, monkeypatch):
 def test_caption_frames_ignores_cache_from_a_different_frame(tmp_path, monkeypatch):
     """A cached record pairs only with the frame whose path it stored."""
     import json
-    import src.captioner as cap
+    import src.inference.captioner as cap
     from src.config import CaptionBackend, CaptioningConfig
 
     frames = [{"frame_id": 0, "timestamp": 0.0, "path": "/run/frames/frame_000000.jpg"}]
@@ -178,8 +178,8 @@ def test_caption_frames_fast_path_submits_all_pending_in_one_call(tmp_path, monk
     """vLLM/oMLX captioning pays one pool over ALL pending frames (no chunk
     barrier) and still persists each frame's JSON as its result lands."""
     import json
-    import src.captioner as cap
-    from src.captioner import OpenAICompatibleCaptioner
+    import src.inference.captioner as cap
+    from src.inference.captioner import OpenAICompatibleCaptioner
     from src.config import CaptionBackend, CaptioningConfig
 
     captioner = OpenAICompatibleCaptioner(
@@ -218,8 +218,8 @@ def test_caption_frames_fast_path_submits_all_pending_in_one_call(tmp_path, monk
 
 def test_caption_frames_fast_path_marks_all_frames_when_batch_raises(tmp_path, monkeypatch):
     """A wholesale batch failure still yields one error marker per frame."""
-    import src.captioner as cap
-    from src.captioner import OpenAICompatibleCaptioner
+    import src.inference.captioner as cap
+    from src.inference.captioner import OpenAICompatibleCaptioner
     from src.config import CaptionBackend, CaptioningConfig
 
     captioner = OpenAICompatibleCaptioner(

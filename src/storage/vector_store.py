@@ -12,7 +12,7 @@ from typing import Optional
 import chromadb
 from chromadb.config import Settings
 
-from .config import VectorDBConfig
+from src.config import VectorDBConfig
 
 
 class ScreenLensVectorStore:

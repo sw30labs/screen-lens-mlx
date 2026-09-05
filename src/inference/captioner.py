@@ -16,8 +16,8 @@ from typing import Callable, Optional
 
 from tqdm import tqdm
 
-from .config import CaptioningConfig, CaptionBackend
-from .omlx_client import InferenceClient, resolve_inference_model, validate_vision_model
+from src.config import CaptioningConfig, CaptionBackend
+from src.inference.client import InferenceClient, resolve_inference_model, validate_vision_model
 
 logger = logging.getLogger("screenlens.captioner")
 

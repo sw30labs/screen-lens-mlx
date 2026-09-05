@@ -129,7 +129,7 @@ class TestFrameExtractor:
     """Test frame extraction (requires ffmpeg)."""
 
     def test_format_timestamp(self):
-        from src.frame_extractor import _format_timestamp
+        from src.video.frame_extractor import _format_timestamp
         assert _format_timestamp(0) == "00:00:00.000"
         assert _format_timestamp(65.5) == "00:01:05.500"
         assert _format_timestamp(3661.123) == "01:01:01.123"
@@ -138,7 +138,7 @@ class TestFrameExtractor:
         self, monkeypatch, caplog,
     ):
         import logging
-        import src.frame_extractor as frame_extractor
+        import src.video.frame_extractor as frame_extractor
 
         monkeypatch.setattr(frame_extractor.shutil, "which", lambda command: None)
         monkeypatch.setattr(
@@ -155,7 +155,7 @@ class TestFrameExtractor:
 
     def test_resize_frame(self):
         from PIL import Image
-        from src.frame_extractor import _resize_frame
+        from src.video.frame_extractor import _resize_frame
 
         img = Image.new("RGB", (1920, 1080))
         resized = _resize_frame(img, 1280)
@@ -170,7 +170,7 @@ class TestOMLXClient:
     """Test the oMLX OpenAI-compatible adapter without network access."""
 
     def test_normalizes_dashboard_url(self):
-        from src.omlx_client import normalize_omlx_base_url
+        from src.inference.client import normalize_omlx_base_url
 
         assert (
             normalize_omlx_base_url("http://127.0.0.1:8000/admin/dashboard?tab=status")
@@ -182,7 +182,7 @@ class TestOMLXClient:
     def test_dotenv_loads_omlx_values_without_overriding_shell(self, monkeypatch, tmp_path):
         import src.config as config_module
         from src.config import CaptioningConfig
-        import src.omlx_client as omlx_client
+        import src.inference.client as omlx_client
 
         (tmp_path / ".env").write_text(
             "\n".join([
@@ -203,7 +203,7 @@ class TestOMLXClient:
 
     def test_rejects_known_text_only_models_for_image_chat(self):
         from src.config import CaptionBackend, CaptioningConfig
-        from src.omlx_client import OMLXClient
+        from src.inference.client import OMLXClient
 
         client = OMLXClient(CaptioningConfig(
             backend=CaptionBackend.omlx,
@@ -215,7 +215,7 @@ class TestOMLXClient:
 
     def test_vllm_defaults_and_legacy_env_isolation(self, monkeypatch):
         from src.config import CaptionBackend, CaptioningConfig, OCRConfig, ReconstructionConfig
-        from src.omlx_client import (
+        from src.inference.client import (
             DEFAULT_VLLM_MODEL,
             resolve_inference_api_key,
             resolve_inference_base_url,
@@ -258,13 +258,13 @@ class TestOMLXClient:
         ) == "legacy-ocr-secret"
 
     def test_nvidia_qwen_spark_model_is_known_multimodal(self):
-        from src.omlx_client import DEFAULT_VLLM_MODEL, is_known_vision_model
+        from src.inference.client import DEFAULT_VLLM_MODEL, is_known_vision_model
 
         assert is_known_vision_model(DEFAULT_VLLM_MODEL)
 
     def test_loopback_requests_bypass_proxy_environment(self, monkeypatch):
         from urllib import request
-        import src.omlx_client as inference_client
+        import src.inference.client as inference_client
 
         captured = {}
         sentinel = object()
@@ -298,8 +298,8 @@ class TestOMLXClient:
     def test_chat_posts_openai_vision_payload(self, monkeypatch, tmp_path):
         from PIL import Image
         from src.config import CaptioningConfig
-        from src.omlx_client import OMLXClient
-        import src.omlx_client as omlx_client
+        from src.inference.client import OMLXClient
+        import src.inference.client as omlx_client
 
         img_path = tmp_path / "frame.jpg"
         Image.new("RGB", (4, 4), color="red").save(img_path)
@@ -363,8 +363,8 @@ class TestOMLXClient:
         expected_max_tokens,
         monkeypatch,
     ):
-        from src.omlx_client import InferenceClient
-        import src.omlx_client as inference_client
+        from src.inference.client import InferenceClient
+        import src.inference.client as inference_client
 
         captured = {}
 
@@ -407,8 +407,8 @@ class TestOMLXClient:
         self,
         monkeypatch,
     ):
-        from src.omlx_client import InferenceClient
-        import src.omlx_client as inference_client
+        from src.inference.client import InferenceClient
+        import src.inference.client as inference_client
 
         chat_payloads = []
         tokenize_payloads = []
@@ -480,7 +480,7 @@ class TestOMLXClient:
         }]
 
     def test_vllm_context_retry_rejects_prompt_larger_than_context(self, monkeypatch):
-        from src.omlx_client import InferenceClient
+        from src.inference.client import InferenceClient
 
         client = InferenceClient.from_endpoint(
             base_url="http://127.0.0.1:8000/v1",
@@ -501,8 +501,8 @@ class TestOMLXClient:
             client._context_retry_payload({"max_tokens": 2048}, 400, detail)
 
     def test_required_complete_generation_rejects_length_finish(self, monkeypatch):
-        from src.omlx_client import InferenceClient, InferenceTruncatedError
-        import src.omlx_client as inference_client
+        from src.inference.client import InferenceClient, InferenceTruncatedError
+        import src.inference.client as inference_client
 
         class FakeResponse:
             def __enter__(self):
@@ -537,8 +537,8 @@ class TestOMLXClient:
             )
 
     def test_chat_timeout_reports_effective_request_budget(self, monkeypatch):
-        from src.omlx_client import InferenceClient
-        import src.omlx_client as inference_client
+        from src.inference.client import InferenceClient
+        import src.inference.client as inference_client
 
         def raise_timeout(req, timeout):
             assert timeout == 1800
@@ -569,14 +569,14 @@ class TestOMLXClient:
     def test_degenerate_repetition_detects_stuck_decoders_only(self, text, flagged):
         """A stuck decoder repeats one short token; reconstructed code repeats
         whole statements and must not be mistaken for it."""
-        from src.omlx_client import degenerate_repetition
+        from src.inference.client import degenerate_repetition
 
         assert bool(degenerate_repetition(text)) is flagged
 
     def test_degenerate_output_is_rejected_not_saved(self, monkeypatch):
         """A stuck decoder must not have its output stored as a result."""
-        from src.omlx_client import InferenceClient, InferenceDegenerateError
-        import src.omlx_client as inference_client
+        from src.inference.client import InferenceClient, InferenceDegenerateError
+        import src.inference.client as inference_client
 
         class FakeResponse:
             def __enter__(self):
@@ -612,7 +612,7 @@ class TestOMLXClient:
         """DeepSeek-V4-Flash under oMLX emits its BOS token to the token limit
         when given a system turn; the same instruction in the user turn works."""
         from src.config import CaptionBackend, CaptioningConfig
-        from src.omlx_client import InferenceClient, mishandles_system_role
+        from src.inference.client import InferenceClient, mishandles_system_role
 
         assert mishandles_system_role("DeepSeek-V4-Flash-0731-MLX")
         assert not mishandles_system_role("Qwen3.6-27B-bf16")
@@ -635,7 +635,7 @@ class TestOMLXClient:
 
     def test_system_turn_is_kept_for_models_that_handle_it(self):
         from src.config import CaptionBackend, CaptioningConfig
-        from src.omlx_client import InferenceClient
+        from src.inference.client import InferenceClient
 
         captured = {}
 
@@ -653,7 +653,7 @@ class TestOMLXClient:
 
     def test_folded_system_turn_survives_image_content_blocks(self):
         """Captioning sends content blocks, not a bare string."""
-        from src.omlx_client import _prepend_instruction
+        from src.inference.client import _prepend_instruction
 
         blocks = [{"type": "text", "text": "describe this"},
                   {"type": "image_url", "image_url": {"url": "data:..."}}]
@@ -673,7 +673,7 @@ class TestCaptioner:
         tmp_path,
     ):
         from PIL import Image
-        from src.captioner import OMLXCaptioner
+        from src.inference.captioner import OMLXCaptioner
         from src.config import CaptionBackend, CaptioningConfig
 
         img_path = tmp_path / "frame.jpg"
@@ -707,7 +707,7 @@ class TestEmbedder:
 
     def test_public_hub_filter_only_suppresses_auth_advisory(self):
         import logging
-        from src.embedder import _PublicHubAuthWarningFilter
+        from src.storage.embedder import _PublicHubAuthWarningFilter
 
         auth_record = logging.LogRecord(
             "huggingface_hub.utils._http",
@@ -770,7 +770,7 @@ class TestEmbedder:
         monkeypatch.setitem(sys.modules, "open_clip", fake_open_clip)
 
         from src.config import EmbeddingConfig
-        from src.embedder import CLIPEmbedder
+        from src.storage.embedder import CLIPEmbedder
         config = EmbeddingConfig(device="cpu")
         return CLIPEmbedder(config)
 
@@ -821,7 +821,7 @@ class TestVectorStore:
     @pytest.fixture
     def store(self, tmp_path):
         from src.config import VectorDBConfig
-        from src.vector_store import ScreenLensVectorStore
+        from src.storage.vector_store import ScreenLensVectorStore
         config = VectorDBConfig(
             persist_directory=str(tmp_path / "chromadb"),
             collection_name="test_collection",
@@ -870,22 +870,22 @@ class TestPipeline:
     """Test LangGraph pipeline construction."""
 
     def test_ingest_graph_builds(self):
-        from src.pipeline import build_ingest_graph
+        from src.workflows.pipeline import build_ingest_graph
         graph = build_ingest_graph()
         assert graph is not None
 
     def test_search_graph_builds(self):
-        from src.pipeline import build_search_graph
+        from src.workflows.pipeline import build_search_graph
         graph = build_search_graph()
         assert graph is not None
 
     def test_full_graph_builds(self):
-        from src.pipeline import build_full_graph
+        from src.workflows.pipeline import build_full_graph
         graph = build_full_graph()
         assert graph is not None
 
     def test_search_summary_uses_selected_vllm_client(self, tmp_path, monkeypatch):
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
         captured = {}
@@ -928,9 +928,9 @@ class TestPipeline:
     def test_summary_refuses_to_present_degenerate_output_as_an_answer(self, tmp_path, monkeypatch):
         """A summary is shown to the user and written to disk; a model stuck in
         a repetition loop must not have its output pass for one."""
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
-        from src.omlx_client import InferenceDegenerateError
+        from src.inference.client import InferenceDegenerateError
 
         class FakeClient:
             backend = InferenceBackend.omlx
@@ -961,7 +961,7 @@ class TestPipeline:
             })
 
     def test_caption_chunks_budget_each_skewed_caption_in_order(self):
-        from src.pipeline import (
+        from src.workflows.pipeline import (
             _chunk_captions_by_budget,
             _compute_chunk_strategy,
             _estimated_caption_tokens,
@@ -999,7 +999,7 @@ class TestPipeline:
         )
 
     def test_caption_chunks_split_one_caption_larger_than_budget(self):
-        from src.pipeline import _chunk_captions_by_budget, _estimated_caption_tokens
+        from src.workflows.pipeline import _chunk_captions_by_budget, _estimated_caption_tokens
 
         original = "0123456789" * 1500
         chunks = _chunk_captions_by_budget(
@@ -1015,7 +1015,7 @@ class TestPipeline:
     def test_reconstruction_single_pass_extraction_uses_full_context_headroom(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         calls = []
 
@@ -1045,7 +1045,7 @@ class TestPipeline:
     def test_reconstruction_multi_chunk_extraction_uses_full_context_headroom(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         calls = []
 
@@ -1077,7 +1077,7 @@ class TestPipeline:
         assert all(call["max_tokens"] == 32768 for call in calls)
 
     def test_reconstruction_long_form_ceiling_tracks_larger_server_context(self):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         class ClientWithSmallerCaptionDefault:
             _default_max_tokens = 32768
@@ -1090,8 +1090,8 @@ class TestPipeline:
     def test_reconstruction_extraction_splits_truncated_caption_group(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
-        from src.omlx_client import InferenceTruncatedError
+        import src.workflows.reconstruct as reconstruct
+        from src.inference.client import InferenceTruncatedError
 
         calls = []
 
@@ -1127,7 +1127,7 @@ class TestPipeline:
     def test_reconstruction_synthesis_uses_full_ceiling_after_planning_headroom(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         captured = {}
 
@@ -1154,7 +1154,7 @@ class TestPipeline:
         assert captured["max_tokens"] == 32768
 
     def test_reconstruction_synthesis_splits_one_oversized_note(self, monkeypatch):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         calls = []
         chunk_budgets = []
@@ -1210,8 +1210,8 @@ class TestPipeline:
     def test_reconstruction_synthesis_retries_truncated_group_with_less_input(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
-        from src.omlx_client import InferenceTruncatedError
+        import src.workflows.reconstruct as reconstruct
+        from src.inference.client import InferenceTruncatedError
 
         calls = []
         truncated_once = False
@@ -1253,7 +1253,7 @@ class TestPipeline:
     def test_reconstruction_synthesis_stops_when_condensation_makes_no_progress(
         self, monkeypatch,
     ):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
 
         calls = []
 
@@ -1282,7 +1282,7 @@ class TestPipeline:
 
     @pytest.mark.parametrize("backend", ["vllm", "omlx"])
     def test_direct_caption_config_uses_reconstruction_timeout(self, backend):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
         config = ScreenLensConfig()
@@ -1301,7 +1301,7 @@ class TestPipeline:
         assert direct.omlx_timeout_seconds == (2400 if backend == "omlx" else 120)
 
     def test_ollama_caption_config_uses_direct_reconstruction_backend(self):
-        import src.reconstruct as reconstruct
+        import src.workflows.reconstruct as reconstruct
         from src.config import CaptionBackend, InferenceBackend, ScreenLensConfig
 
         config = ScreenLensConfig()
@@ -1427,7 +1427,7 @@ class TestRunReuse:
         assert not transcribe_run_matches(run, video)
 
     def test_ingest_node_reuses_cached_extraction(self, tmp_path, monkeypatch):
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import ScreenLensConfig
 
         video = tmp_path / "demo.mov"
@@ -1454,9 +1454,9 @@ class TestRunReuse:
 
     def test_embed_node_skips_populated_store(self, tmp_path, monkeypatch):
         import numpy as np
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import ScreenLensConfig
-        from src.vector_store import ScreenLensVectorStore
+        from src.storage.vector_store import ScreenLensVectorStore
 
         config = ScreenLensConfig()
         config.data_dir = tmp_path
@@ -1481,9 +1481,9 @@ class TestRunReuse:
 
     def test_embed_node_rebuilds_partial_store(self, tmp_path, monkeypatch):
         import numpy as np
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import ScreenLensConfig
-        from src.vector_store import ScreenLensVectorStore
+        from src.storage.vector_store import ScreenLensVectorStore
 
         config = ScreenLensConfig()
         config.data_dir = tmp_path
@@ -1515,7 +1515,7 @@ class TestRunReuse:
 class TestSharedEmbedder:
     def test_shared_embedder_reuses_one_instance_per_model_and_device(self):
         from src.config import EmbeddingConfig
-        from src.embedder import _SHARED, get_shared_embedder
+        from src.storage.embedder import _SHARED, get_shared_embedder
 
         _SHARED.clear()
         try:
@@ -1529,7 +1529,7 @@ class TestSharedEmbedder:
 
     def test_search_node_uses_the_shared_embedder(self, monkeypatch):
         import numpy as np
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import ScreenLensConfig
 
         calls = []
@@ -1585,7 +1585,7 @@ class TestSummaryCache:
         }
 
     def test_summarize_node_reuses_cached_answer(self, tmp_path, monkeypatch):
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import InferenceBackend
 
         calls = {"n": 0}
@@ -1612,7 +1612,7 @@ class TestSummaryCache:
         assert (tmp_path / "summary_cache.json").exists()
 
     def test_summarize_node_cache_misses_on_a_new_query(self, tmp_path, monkeypatch):
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import InferenceBackend
 
         calls = {"n": 0}
@@ -1637,7 +1637,7 @@ class TestSummaryCache:
         assert calls["n"] == 2
 
     def test_summarize_all_node_caches_full_video_summary(self, tmp_path, monkeypatch):
-        import src.pipeline as pipeline
+        import src.workflows.pipeline as pipeline
         from src.config import InferenceBackend
 
         calls = {"n": 0}

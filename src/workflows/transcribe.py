@@ -19,10 +19,10 @@ import re
 import time
 from pathlib import Path
 
-from .config import ScreenLensConfig
-from .frame_select import select_frames
-from .ocr import VerbatimOCR
-from .omlx_client import (
+from src.config import ScreenLensConfig
+from src.video.frame_select import select_frames
+from src.inference.ocr import VerbatimOCR
+from src.inference.client import (
     InferenceClient,
     degenerate_repetition,
     resolve_llm_model,
@@ -32,7 +32,7 @@ from .omlx_client import (
     resolve_role_base_url,
     resolve_role_context,
 )
-from .stitch import stitch_frames
+from src.video.stitch import stitch_frames
 
 logger = logging.getLogger("screenlens.transcribe")
 

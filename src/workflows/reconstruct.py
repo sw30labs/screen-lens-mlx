@@ -27,13 +27,13 @@ from typing import Annotated, Optional, TypedDict
 from langgraph.graph import StateGraph, START, END
 from langgraph.types import Send
 
-from .config import ScreenLensConfig
-from .omlx_client import InferenceClient, InferenceTruncatedError
-from .session import text_role_captioning_config
+from src.config import ScreenLensConfig
+from src.inference.client import InferenceClient, InferenceTruncatedError
+from src.session import text_role_captioning_config
 # Reuse the chunk-strategy math from the summarization pipeline. It's the same
 # token-budget problem (fit a long caption stream into a fixed model context),
 # so we deliberately share the helper rather than duplicate the constants.
-from .pipeline import _chunk_captions_by_budget, _compute_chunk_strategy
+from src.workflows.pipeline import _chunk_captions_by_budget, _compute_chunk_strategy
 
 logger = logging.getLogger("screenlens.reconstruct")
 

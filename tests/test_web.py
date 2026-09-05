@@ -426,7 +426,7 @@ class TestWebSecurity:
 
 
 def test_probe_uses_selected_endpoint(monkeypatch):
-    from src.omlx_client import resolve_inference_base_url
+    from src.inference.client import resolve_inference_base_url
     monkeypatch.setattr(runner, "endpoint_status", lambda config: {
         "url": resolve_inference_base_url(config.captioning),
         "backend": config.captioning.backend.value,

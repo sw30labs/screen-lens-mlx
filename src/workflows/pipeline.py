@@ -19,19 +19,19 @@ from typing import TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from .config import ScreenLensConfig
-from .frame_extractor import extract_frames, get_video_metadata
-from .captioner import caption_frames
-from .embedder import CLIPEmbedder, get_shared_embedder
-from .omlx_client import (
+from src.config import ScreenLensConfig
+from src.video.frame_extractor import extract_frames, get_video_metadata
+from src.inference.captioner import caption_frames
+from src.storage.embedder import CLIPEmbedder, get_shared_embedder
+from src.inference.client import (
     InferenceClient,
     InferenceDegenerateError,
     degenerate_repetition,
     resolve_inference_context,
     resolve_inference_model,
 )
-from .session import load_cached_frames, text_role_captioning_config
-from .vector_store import ScreenLensVectorStore
+from src.session import load_cached_frames, text_role_captioning_config
+from src.storage.vector_store import ScreenLensVectorStore
 
 
 # ── Pipeline State ──────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from .config import FrameExtractionConfig, ExtractionStrategy
+from src.config import FrameExtractionConfig, ExtractionStrategy
 
 logger = logging.getLogger("screenlens.frame_extractor")
 

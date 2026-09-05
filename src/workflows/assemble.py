@@ -35,8 +35,8 @@ from typing import Optional, TypedDict
 
 from langgraph.graph import StateGraph, START, END
 
-from .config import ScreenLensConfig
-from .reconstruct import get_inference_client, generate_text, parse_json_response
+from src.config import ScreenLensConfig
+from src.workflows.reconstruct import get_inference_client, generate_text, parse_json_response
 
 logger = logging.getLogger("screenlens.assemble")
 

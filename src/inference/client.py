@@ -17,7 +17,7 @@ from urllib import request
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit, urlunsplit
 
-from .config import (
+from src.config import (
     CaptionBackend,
     CaptioningConfig,
     InferenceBackend,

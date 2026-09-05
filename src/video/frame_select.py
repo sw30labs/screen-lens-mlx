@@ -24,7 +24,7 @@ import numpy as np
 from PIL import Image
 from skimage.metrics import structural_similarity as ssim
 
-from .config import FrameSelectionConfig
+from src.config import FrameSelectionConfig
 
 logger = logging.getLogger("screenlens.frame_select")
 

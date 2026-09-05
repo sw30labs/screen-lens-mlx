@@ -26,8 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-from ..config import ScreenLensConfig
-from ..session import (
+from src.config import ScreenLensConfig
+from src.session import (
     VIDEO_SUFFIXES,
     apply_direct_inference,
     apply_video_slug,
@@ -310,7 +310,7 @@ def _build_config(params: dict[str, Any]) -> ScreenLensConfig:
     """Apply dashboard form values onto a freshly loaded config."""
     config = load_config(params.get("config_file") or None)
 
-    from ..config import default_inference_backend
+    from src.config import default_inference_backend
 
     configured = config.captioning.backend.value
     if configured not in ("omlx", "vllm"):
@@ -456,8 +456,8 @@ def _prepare_run_folder(
 
 
 def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
-    from ..config import ExtractionStrategy
-    from ..pipeline import build_ingest_graph
+    from src.config import ExtractionStrategy
+    from src.workflows.pipeline import build_ingest_graph
 
     video = Path(str(params["video_path"])).expanduser().resolve()
     if params.get("strategy"):
@@ -492,7 +492,7 @@ def _run_ingest(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, A
 
 
 def _run_transcribe(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
-    from ..transcribe import transcribe_video
+    from src.workflows.transcribe import transcribe_video
 
     video = Path(str(params["video_path"])).expanduser().resolve()
     if params.get("sample_fps"):
@@ -514,7 +514,7 @@ def _run_transcribe(params: dict[str, Any], config: ScreenLensConfig) -> dict[st
 
 
 def _run_reconstruct(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
-    from ..reconstruct import reconstruct_folder
+    from src.workflows.reconstruct import reconstruct_folder
 
     data_dir = str(params.get("data_dir") or "./data")
     slug = str(params.get("run_slug") or "").strip()
@@ -547,7 +547,7 @@ def _run_reconstruct(params: dict[str, Any], config: ScreenLensConfig) -> dict[s
 
 
 def _run_summarize(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
-    from ..pipeline import summarize_all_node
+    from src.workflows.pipeline import summarize_all_node
 
     data_dir = str(params.get("data_dir") or "./data")
     folder = resolve_run(str(params["run_slug"]), data_dir)
@@ -573,7 +573,7 @@ def _run_summarize(params: dict[str, Any], config: ScreenLensConfig) -> dict[str
 
 
 def _run_assemble(params: dict[str, Any], config: ScreenLensConfig) -> dict[str, Any]:
-    from ..assemble import assemble_corpus
+    from src.workflows.assemble import assemble_corpus
 
     data_dir = str(params.get("data_dir") or "./data")
     output_dir = str(params.get("output_dir") or "./assembled")
@@ -594,7 +594,7 @@ _RUNNERS: dict[str, Callable[[dict[str, Any], ScreenLensConfig], dict[str, Any]]
 
 def search_now(params: dict[str, Any]) -> dict[str, Any]:
     """Run a CLIP/ChromaDB search inline — fast enough not to need a job."""
-    from ..pipeline import build_search_graph, search_node
+    from src.workflows.pipeline import build_search_graph, search_node
 
     query = str(params.get("query") or "").strip()
     if not query:
@@ -628,6 +628,6 @@ def search_now(params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _base(name: str) -> str:
-    from ..session import base_slug
+    from src.session import base_slug
 
     return base_slug(name)

@@ -20,7 +20,7 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
-from .config import (
+from src.config import (
     ScreenLensConfig,
     CaptionBackend,
     ExtractionStrategy,
@@ -30,9 +30,9 @@ from .config import (
     default_inference_backend,
     default_inference_concurrency,
 )
-from .omlx_client import resolve_inference_model, resolve_llm_model, resolve_ocr_model
-from .pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
-from .session import (
+from src.inference.client import resolve_inference_model, resolve_llm_model, resolve_ocr_model
+from src.workflows.pipeline import build_ingest_graph, build_search_graph, build_full_graph, summarize_all_node
+from src.session import (
     apply_video_slug,
     extraction_meta_matches,
     find_reusable_run,
@@ -670,7 +670,7 @@ def reconstruct(
         screenlens reconstruct                                    # Reconstruct all videos
         screenlens reconstruct existinginvestment_20260408_223036  # Reconstruct one video
     """
-    from .reconstruct import reconstruct_folder
+    from src.workflows.reconstruct import reconstruct_folder
 
     base = Path(data_dir)
     if not base.is_dir():
@@ -814,7 +814,7 @@ def assemble(
         screenlens assemble --dry-run                      # gate + classify only
         screenlens assemble --mapping path/to/manifest.json  # skip inference
     """
-    from .assemble import assemble_corpus
+    from src.workflows.assemble import assemble_corpus
 
     config = _load_config(config_file)
     _apply_captioning_options(
@@ -876,8 +876,8 @@ def transcribe(
     Pipeline: scroll-safe frame selection → vision OCR → text-space stitch →
     LLM seam/indent cleanup. Output is written to ./data/<slug>/output/transcript.md.
     """
-    from .transcribe import transcribe_video
-    from .omlx_client import normalize_api_base_url
+    from src.workflows.transcribe import transcribe_video
+    from src.inference.client import normalize_api_base_url
 
     video = Path(video_path)
     if not video.exists():
@@ -910,7 +910,7 @@ def transcribe(
     if reused:
         console.print(f"[dim]Resuming run {slug} — cached OCR is reused (--fresh to start over)[/dim]")
 
-    from .omlx_client import resolve_ocr_model, resolve_llm_model
+    from src.inference.client import resolve_ocr_model, resolve_llm_model
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Verbatim Transcription[/bold green]\n"
         f"Video: {video.name} ({video.stat().st_size / (1024**2):.0f} MB)\n"
@@ -957,7 +957,7 @@ def models(
     ),
 ):
     """List served models and flag which can do OCR (vision)."""
-    from .omlx_client import (
+    from src.inference.client import (
         list_models,
         is_known_text_only_model,
         is_known_vision_model,
@@ -1004,7 +1004,7 @@ def serve(
 
     Binds loopback-only by design: it starts jobs and reads frames off disk.
     """
-    from .web.server import serve as serve_dashboard
+    from src.web.server import serve as serve_dashboard
 
     console.print(Panel.fit(
         f"[bold green]ScreenLens — Web Command Deck[/bold green]\n"
@@ -1027,7 +1027,7 @@ def info(
 ):
     """Show info about the current vector store."""
     config = _load_config(config_file)
-    from .vector_store import ScreenLensVectorStore
+    from src.storage.vector_store import ScreenLensVectorStore
 
     store = ScreenLensVectorStore(config.vector_db)
     count = store.count()

@@ -12,7 +12,7 @@ from typing import Optional
 
 from tqdm import tqdm
 
-from .config import EmbeddingConfig
+from src.config import EmbeddingConfig
 
 
 class _PublicHubAuthWarningFilter(logging.Filter):

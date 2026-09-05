@@ -95,7 +95,7 @@ Stdlib `http.server` only — the same ADR-008 pattern as contingency-atlas and 
 - `runner.py` — one job at a time behind a lock (the pipelines share one model endpoint and one CLIP device). Pipeline `print()`/`logging` output is captured into a ring buffer the page tails. `set_pipeline_override` is the test seam: `tests/test_web.py` exercises the whole job lifecycle without a model, GPU, or ffmpeg.
 - `static/index.html` — the SPA. If you add an endpoint, `test_index_calls_only_real_endpoints` will catch a page that calls something the server does not serve.
 
-### Pipeline 1 — Ingest / Search (`src/pipeline.py`)
+### Pipeline 1 — Ingest / Search (`src/workflows/pipeline.py`)
 
 `StateGraph` over a `ScreenLensState` TypedDict. Three graph builders:
 
@@ -116,7 +116,7 @@ Per-stage modules:
 
 State flows by returning partial dicts that LangGraph merges; `elapsed_seconds` accumulates per-stage timings.
 
-### Pipeline 2 — Reconstruct (`src/reconstruct.py`)
+### Pipeline 2 — Reconstruct (`src/workflows/reconstruct.py`)
 
 A more sophisticated graph: `classify → plan → (parallel workers | sequential) → qa_reflect → save`, with a retry edge from `qa_reflect → plan` that can loop up to `MAX_QA_ITERATIONS = 3`.
 
@@ -128,7 +128,7 @@ Key mechanics worth knowing before editing:
 - **Reflection feedback loop.** When `qa_reflect_node` fails, it stores `qa_feedback` and increments `qa_iteration`; the next pass through `plan_node` injects `PREVIOUS QA FEEDBACK` into each task prompt. After `MAX_QA_ITERATIONS - 1`, QA force-passes to avoid infinite loops.
 - **JSON parsing.** LLM JSON responses are parsed via `parse_json_response`, which tries direct → fenced → first `{...}` block. Always use this helper rather than `json.loads` directly on model output.
 
-### Pipeline 3 — Transcribe (`src/transcribe.py`)
+### Pipeline 3 — Transcribe (`src/workflows/transcribe.py`)
 
 The verbatim path. Not a `StateGraph` — a straight function pipeline:
 `select_frames → VerbatimOCR → stitch_frames → (optional) LLM cleanup → output/transcript.md`.

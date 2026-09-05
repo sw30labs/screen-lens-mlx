@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from src.stitch import stitch_frames, detect_boilerplate, line_ratio
+from src.video.stitch import stitch_frames, detect_boilerplate, line_ratio
 from src.config import OCRConfig, FrameSelectionConfig
-from src.ocr import VerbatimOCR, _NO_IMAGE_RE
+from src.inference.ocr import VerbatimOCR, _NO_IMAGE_RE
 
 
 # ── Stitching ────────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ def test_no_image_sentinel_regex():
 
 def test_transcribe_end_to_end_with_mock_ocr(tmp_path, monkeypatch):
     """Full pipeline glue: select → OCR → stitch → write, with no real server."""
-    import src.transcribe as T
+    import src.workflows.transcribe as T
     from src.config import ScreenLensConfig
 
     doc = [f"def step_{i}(x):  # row {i}" for i in range(40)]
@@ -165,7 +165,7 @@ def test_transcribe_end_to_end_with_mock_ocr(tmp_path, monkeypatch):
 # response was untagged/truncated reasoning that leaked into transcript.md.
 
 def test_strip_thinking_handles_truncated_open_tag():
-    from src.omlx_client import strip_thinking
+    from src.inference.client import strip_thinking
     # complete block
     assert strip_thinking("<think>reasoning</think>\n\nANSWER") == "ANSWER"
     # dangling close (opening tag was a prompt prefix) — keep the answer
@@ -181,7 +181,7 @@ def test_ocr_disables_thinking_in_request_payload(monkeypatch, tmp_path):
     model produces the transcription instead of burning the budget on CoT."""
     import json
     from PIL import Image
-    import src.omlx_client as omlx_client
+    import src.inference.client as omlx_client
 
     img_path = tmp_path / "frame.png"
     Image.new("RGB", (4, 4), color="white").save(img_path)
@@ -218,7 +218,7 @@ def test_ocr_disables_thinking_in_request_payload(monkeypatch, tmp_path):
 # chunk whenever the repaired output dropped too many input lines.
 
 def test_chunk_coverage_metric():
-    from src.transcribe import _chunk_coverage
+    from src.workflows.transcribe import _chunk_coverage
     src = "line one\n    line two\nline three"
     assert _chunk_coverage(src, "line one\nline two\n  line three") == 1.0  # reindent ok
     assert round(_chunk_coverage(src, "line one\nline three"), 2) == 0.67   # dropped a line
@@ -226,8 +226,8 @@ def test_chunk_coverage_metric():
 
 
 def test_cleanup_falls_back_to_raw_when_llm_drops_content(monkeypatch):
-    import src.omlx_client as omlx_client
-    import src.transcribe as T
+    import src.inference.client as omlx_client
+    import src.workflows.transcribe as T
     from src.config import ScreenLensConfig
 
     raw = "\n\n".join(f"keep_line_{i} = {i}" for i in range(20))
@@ -258,7 +258,7 @@ REAL_VIDEO = Path(__file__).resolve().parents[1] / "input" / "policies.mov"
 
 @pytest.mark.skipif(not REAL_VIDEO.exists(), reason="sample recording not present")
 def test_select_frames_on_real_video(tmp_path):
-    from src.frame_select import select_frames
+    from src.video.frame_select import select_frames
     meta = select_frames(str(REAL_VIDEO), str(tmp_path), FrameSelectionConfig(sample_fps=2.0))
     assert len(meta) > 10                       # got real frames
     assert all(Path(m["path"]).exists() for m in meta)
@@ -270,7 +270,7 @@ def test_select_frames_on_real_video(tmp_path):
 def test_transcribe_reports_degenerate_frames_without_editing_them():
     """A frame where the OCR model got stuck must be flagged, not trimmed —
     the raw transcript is defined as byte-faithful to what the model read."""
-    from src.omlx_client import degenerate_repetition
+    from src.inference.client import degenerate_repetition
 
     stuck = "INSERT INTO t VALUES ('a', 'b');\n" + "!" * 400
     assert degenerate_repetition(stuck) == "!"
@@ -303,7 +303,7 @@ def _naive_canon_ids(norm_a, norm_b, fuzzy):
 
 
 def test_canon_ids_matches_naive_scan():
-    from src.stitch import _canon_ids
+    from src.video.stitch import _canon_ids
 
     fixtures = [
         (["alpha", "beta", "alpha"], ["beta", "gamma"]),          # exact repeats
@@ -322,7 +322,7 @@ def test_canon_ids_matches_naive_scan():
 
 
 def _counting_sequence_matcher(monkeypatch):
-    import src.stitch as stitch
+    import src.video.stitch as stitch
     from difflib import SequenceMatcher as RealSM
 
     calls = []
@@ -337,7 +337,7 @@ def _counting_sequence_matcher(monkeypatch):
 
 
 def test_canon_ids_exact_hits_skip_fuzzy_scan(monkeypatch):
-    import src.stitch as stitch
+    import src.video.stitch as stitch
 
     calls = _counting_sequence_matcher(monkeypatch)
     a = ["alpha", "beta"]
@@ -349,7 +349,7 @@ def test_canon_ids_exact_hits_skip_fuzzy_scan(monkeypatch):
 
 
 def test_canon_ids_length_gate_skips_fuzzy_scan(monkeypatch):
-    import src.stitch as stitch
+    import src.video.stitch as stitch
 
     calls = _counting_sequence_matcher(monkeypatch)
     ids = stitch._canon_ids(["ab", "abcdefgh"], [], 0.85)
@@ -373,7 +373,7 @@ _RESUME_TEXTS = {
 
 
 def _resume_mocks(monkeypatch, calls):
-    import src.transcribe as T
+    import src.workflows.transcribe as T
 
     monkeypatch.setattr(T, "select_frames", lambda *a, **k: list(_RESUME_META))
 
@@ -394,7 +394,7 @@ def _resume_mocks(monkeypatch, calls):
 
 def test_transcribe_resume_reuses_cached_ocr(tmp_path, monkeypatch):
     """A re-run over a populated ocr/ dir never constructs the OCR client."""
-    import src.transcribe as T
+    import src.workflows.transcribe as T
     from src.config import ScreenLensConfig
 
     calls = []
@@ -421,7 +421,7 @@ def test_transcribe_resume_reuses_cached_ocr(tmp_path, monkeypatch):
 def test_transcribe_resume_ocrs_only_missing_frames(tmp_path, monkeypatch):
     """A partial OCR cache sends only the uncovered frames to the model."""
     import json
-    import src.transcribe as T
+    import src.workflows.transcribe as T
     from src.config import ScreenLensConfig
 
     ocr_dir = tmp_path / "ocr"
@@ -446,7 +446,7 @@ def test_image_data_url_reencodes_png_to_jpeg_on_the_wire(tmp_path):
     import base64 as b64
     import io
     from PIL import Image
-    from src.omlx_client import _image_data_url
+    from src.inference.client import _image_data_url
 
     # Noise compresses poorly as PNG, so the wire saving shows up even tiny.
     png = tmp_path / "frame.png"
@@ -470,7 +470,7 @@ def test_image_data_url_reencodes_png_to_jpeg_on_the_wire(tmp_path):
 
 
 def test_wire_jpeg_is_opt_in_on_the_client():
-    from src.omlx_client import InferenceClient
+    from src.inference.client import InferenceClient
 
     wired = InferenceClient.from_endpoint(
         base_url="http://127.0.0.1:8000/v1", model="m", api_key=None,

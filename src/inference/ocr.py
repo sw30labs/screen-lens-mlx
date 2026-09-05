@@ -22,8 +22,8 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
-from .config import OCRConfig
-from .omlx_client import (
+from src.config import OCRConfig
+from src.inference.client import (
     InferenceClient,
     resolve_ocr_model,
     resolve_role_api_key,

@@ -9,7 +9,7 @@ import json
 
 import pytest
 
-import src.reconstruct as reconstruct
+import src.workflows.reconstruct as reconstruct
 from src.config import ScreenLensConfig
 
 
