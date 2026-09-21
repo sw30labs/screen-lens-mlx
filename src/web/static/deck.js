@@ -15,6 +15,7 @@ let SELECTED = null;      // slug
 let SNAPSHOT = null;      // detailed snapshot of SELECTED
 let BUSY = false;
 let MODELS = {all: [], vision: [], text: []};
+let ENDPOINT = {query: null, loading: false, reachable: false, detail: ""};
 
 function esc(s) {
   return String(s ?? "").replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -60,9 +61,10 @@ function post(path, body) {
 function endpointQuery() {
   return "?" + new URLSearchParams({backend: $("#f-backend").value, base_url: $("#f-baseurl").value});
 }
-async function loadRoles() {
+async function loadRoles(query, revision) {
   try {
-    const roles = await api("/api/roles" + endpointQuery());
+    const roles = await api("/api/roles" + query);
+    if (revision !== endpointRevision || query !== endpointQuery()) return null;
     const v = roles.caption || {}, t = roles.text || {};
     const vb = $("#badge-vision");
     vb.textContent = "◉ " + (v.model || "—");
@@ -71,7 +73,6 @@ async function loadRoles() {
       (v.vision_ok === false ? " — NOT vision-capable, captions/OCR will fail" : "");
     $("#badge-text").textContent = "▤ " + (t.model || "—");
     $("#badge-text").title = `Text role — ${t.provider} @ ${t.base_url}`;
-    if (!$("#f-baseurl").value) $("#f-baseurl").value = v.base_url || "";
     return roles;
   } catch (e) { return null; }
 }
@@ -79,27 +80,41 @@ async function loadRoles() {
 let endpointRevision = 0;
 async function loadBackend() {
   const revision = ++endpointRevision;
+  const query = endpointQuery();
+  ENDPOINT = {query, loading: true, reachable: false, detail: ""};
+  MODELS = {all: [], vision: [], text: []};
+  $("#f-vision").innerHTML = $("#f-text").innerHTML = '<option value="">Checking endpoint…</option>';
+  $("#backend-status").textContent = "● checking endpoint…";
   try {
-    const d = await api("/api/backend" + endpointQuery());
-    if (revision !== endpointRevision) return;
+    const d = await api("/api/backend" + query);
+    if (revision !== endpointRevision || query !== endpointQuery()) return;
     const el = $("#backend-status");
     if (d.reachable) {
+      if (!$("#f-baseurl").value.trim()) $("#f-baseurl").value = d.base_url || "";
+      const verifiedQuery = endpointQuery();
       MODELS = {all: d.models || [], vision: d.vision_models || [], text: d.text_models || []};
       el.innerHTML = `<span style="color:var(--green)">●</span> ${esc(d.provider)} reachable at ${esc(d.base_url)} — ${MODELS.all.length} model(s)`;
-      await fillModelSelects(revision);
+      await fillModelSelects(verifiedQuery, revision);
+      if (revision !== endpointRevision || verifiedQuery !== endpointQuery()) return;
+      ENDPOINT = {query: verifiedQuery, loading: false, reachable: true, detail: ""};
     } else {
-      MODELS = {all: [], vision: [], text: []};
-      $("#f-vision").innerHTML = ""; $("#f-text").innerHTML = "";
-      el.innerHTML = `<span style="color:var(--amber)">●</span> ${esc(d.provider)} offline at ${esc(d.base_url)}${d.detail ? " — " + esc(d.detail) : ""}`;
+      const detail = `${d.provider} unreachable at ${d.base_url}${d.detail ? " — " + d.detail : ""}. Check the endpoint URL and server, then click Retry connection.`;
+      ENDPOINT = {query, loading: false, reachable: false, detail};
+      $("#f-vision").innerHTML = $("#f-text").innerHTML = '<option value="">Endpoint unavailable</option>';
+      el.innerHTML = `<span style="color:var(--amber)">●</span> ${esc(detail)}`;
     }
   } catch (e) {
-    $("#backend-status").textContent = "endpoint probe failed";
+    if (revision !== endpointRevision || query !== endpointQuery()) return;
+    const detail = `Endpoint check failed: ${e.message}. Click Retry connection.`;
+    ENDPOINT = {query, loading: false, reachable: false, detail};
+    $("#f-vision").innerHTML = $("#f-text").innerHTML = '<option value="">Endpoint unavailable</option>';
+    $("#backend-status").textContent = detail;
   }
 }
 
-async function fillModelSelects(revision) {
-  const roles = await loadRoles();
-  if (revision !== endpointRevision) return;
+async function fillModelSelects(query, revision) {
+  const roles = await loadRoles(query, revision);
+  if (revision !== endpointRevision || query !== endpointQuery()) return;
   const opt = (list, current, note) => {
     const seen = new Set();
     const items = [];
@@ -361,6 +376,16 @@ $("#f-video-pick").addEventListener("change", e => { if (e.target.value) $("#f-v
 
 async function startRun() {
   const pipeline = $("#f-pipeline").value;
+  if (pipeline !== "assemble") {
+    if (ENDPOINT.loading || ENDPOINT.query !== endpointQuery()) {
+      alert("Wait for the selected endpoint check to finish, or click Retry connection.");
+      return;
+    }
+    if (!ENDPOINT.reachable) {
+      alert(ENDPOINT.detail || "The selected endpoint is unavailable. Click Retry connection.");
+      return;
+    }
+  }
   const body = {
     pipeline,
     backend: $("#f-backend").value,
@@ -369,7 +394,7 @@ async function startRun() {
     text_model: $("#f-text").value || null,
   };
   if (["ingest", "transcribe"].includes(pipeline) && !body.vision_model) {
-    alert("This endpoint has no recognized vision model. Choose Spark or serve a vision model in oMLX.");
+    alert("The selected endpoint is reachable but has no recognized vision model. Serve a vision model on this endpoint, then click Retry connection.");
     return;
   }
   if (["summarize", "reconstruct"].includes(pipeline) && !body.text_model) {
@@ -509,10 +534,11 @@ $("#frames-reload").addEventListener("click", () => SELECTED && selectRun(SELECT
 $("#art-reload").addEventListener("click", () => SELECTED && selectRun(SELECTED));
 $("#f-backend").addEventListener("change", () => {
   $("#f-baseurl").value = $("#f-backend").value === "vllm"
-    ? "http://192.168.86.44:8000/v1" : "http://127.0.0.1:8000/v1";
+    ? "http://sparkone.local:8000/v1" : "http://127.0.0.1:8000/v1";
   loadBackend();
 });
 $("#f-baseurl").addEventListener("change", loadBackend);
+$("#backend-retry").addEventListener("click", loadBackend);
 
 (async function init() {
   applyNeeds();

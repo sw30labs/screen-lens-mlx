@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
 import threading
 import time
 import urllib.error
@@ -439,6 +441,29 @@ def test_probe_uses_selected_endpoint(monkeypatch):
 def test_dashboard_requires_spark_or_omlx():
     with pytest.raises(ValueError, match="Spark cluster"):
         runner._build_config({"backend": "ollama"})
+
+
+def test_spark_probe_offers_served_qwen38_for_vision(monkeypatch):
+    def fake_models(base_url, api_key, timeout):
+        assert base_url == "http://sparkone.local:8000/v1"
+        return ["qwen3.8-flash-next", "deepseek-v4-flash"]
+
+    monkeypatch.setattr("src.session.list_models", fake_models)
+    result = runner.probe_endpoint(backend="vllm", base_url="http://sparkone.local:8000/v1")
+    assert result["reachable"] is True
+    assert result["vision_models"] == ["qwen3.8-flash-next"]
+    assert result["text_models"] == ["deepseek-v4-flash"]
+
+
+def test_dashboard_endpoint_interactions():
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node.js is needed for the dashboard interaction tests")
+    result = subprocess.run(
+        [node, "--test", str(Path(__file__).with_name("test_deck.cjs"))],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.parametrize("asset, mime", [("deck.css", "text/css"), ("deck.js", "text/javascript")])

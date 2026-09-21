@@ -411,13 +411,20 @@ Each profile will tune frame extraction, captioning prompts, chunking, and audio
 ### Command deck: Spark and oMLX
 
 Run `screenlens serve` to open the Nightshift-style command deck. Choose
-**Spark cluster · vLLM** for `http://192.168.86.44:8000/v1`, or
+**Spark cluster · vLLM** for `http://sparkone.local:8000/v1`, or
 **oMLX · Apple Silicon** for `http://127.0.0.1:8000/v1`. These presets match
 Nightshift; the endpoint field remains editable for other cluster addresses.
 Endpoint checks and model lists follow the selected backend and URL, and jobs
 use those same form values. Select a served vision model for captions/OCR and
 a served text model for reconstruction. The deck supports only these two
 inference backends; existing CLI compatibility is retained.
+
+The Spark preset uses the cluster hostname so a changed LAN IP does not leave
+it pointing at an old address. Qwen3.8 models (including the served alias
+`qwen3.8-flash-next`) are recognized for captions/OCR. If an endpoint check
+fails, correct the URL or restore the server, then click **Retry connection**.
+An unreachable endpoint is reported separately from a reachable server with
+no recognized vision models; switching endpoints clears the old model choices.
 
 ### Package boundaries
 

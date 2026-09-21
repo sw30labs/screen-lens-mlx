@@ -262,6 +262,17 @@ class TestOMLXClient:
 
         assert is_known_vision_model(DEFAULT_VLLM_MODEL)
 
+    @pytest.mark.parametrize("model", [
+        "qwen3.8-flash-next",
+        "nvidia/Qwen3.8-Flash-Next-NVFP4",
+        "Qwen3.8-27B-bf16",
+    ])
+    def test_qwen38_is_known_multimodal(self, model):
+        from src.inference.client import is_known_vision_model, is_known_text_only_model
+
+        assert is_known_vision_model(model)
+        assert not is_known_text_only_model(model)
+
     def test_loopback_requests_bypass_proxy_environment(self, monkeypatch):
         from urllib import request
         import src.inference.client as inference_client

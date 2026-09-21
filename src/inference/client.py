@@ -71,11 +71,12 @@ _KNOWN_TEXT_ONLY_PATTERNS = (
 )
 _KNOWN_VISION_MARKERS = ("vl", "vision", "omni", "janus")
 # Unified/multimodal model families whose names DON'T contain a vision marker
-# but which do accept image input (verified June 2026). Matched on the
+# but which do accept image input. Matched on the
 # normalized id (non-alphanumerics → '-'). VL/vision markers above still win.
 _KNOWN_VISION_PATTERNS = (
     "gemma-4", "gemma-3",          # Gemma 3/4 are natively multimodal (OCR/doc/screen)
     "qwen3-6", "qwen3-5",          # Qwen3.5/3.6 are unified multimodal
+    "qwen3-8",                     # Includes Spark's qwen3.8-flash-next served alias
     "qwen2-5-vl", "qwen3-vl",
     "pixtral", "internvl", "minicpm-v", "llava", "molmo", "kimi-vl",
 )

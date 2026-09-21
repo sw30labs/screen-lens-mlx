@@ -275,10 +275,17 @@ oMLX settings on Apple Silicon; use this helper only on Linux/ARM64 DGX Spark.
 ### Command deck: Spark and oMLX
 
 Run `screenlens serve` to open the Nightshift-style command deck. Choose
-**Spark cluster · vLLM** for `http://192.168.86.44:8000/v1`, or
+**Spark cluster · vLLM** for `http://sparkone.local:8000/v1`, or
 **oMLX · Apple Silicon** for `http://127.0.0.1:8000/v1`. These presets match
 Nightshift; the endpoint field remains editable for other cluster addresses.
 Endpoint checks and model lists follow the selected backend and URL, and jobs
 use those same form values. Select a served vision model for captions/OCR and
 a served text model for reconstruction. The deck supports only these two
 inference backends; existing CLI compatibility is retained.
+
+The Spark preset uses the cluster hostname instead of a fixed LAN IP. Set the
+endpoint field to your own host if different. Qwen3.8 models, including
+`qwen3.8-flash-next`, appear in the vision selector. After correcting a URL or
+restoring the service, click **Retry connection** to refresh the model list.
+Connection failures are shown separately from missing vision models, and old
+model choices are cleared while checking a newly selected endpoint.
